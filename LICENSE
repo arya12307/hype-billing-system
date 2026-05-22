@@ -1,0 +1,71 @@
+MIT License with Attribution
+
+Copyright (c) 2025-2026 Nexuzy Lab
+All Rights Reserved.
+
+Lead Developer: David (DevilOne)
+Organization:   Nexuzy Lab
+Project:        Hype ERP - Enterprise Resource Planning System
+GitHub:         https://github.com/david0154/hype-billing-system
+Developer:      https://github.com/david0154
+Org:            https://github.com/nexuzy-lab
+
+-------------------------------------------------------------------------------
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, and/or use copies of the
+Software in personal or commercial projects, subject to the following
+conditions:
+
+1. ATTRIBUTION REQUIRED
+   The above copyright notice, this permission notice, and the following
+   attribution must be included in all copies, forks, or substantial
+   portions of the Software:
+
+       "Hype ERP - Developed by Nexuzy Lab | Lead Developer: David (DevilOne)
+        https://github.com/david0154"
+
+2. BRANDING NON-REMOVABLE
+   The "Hype ERP" brand name, logo, and in-app branding embedded in invoices,
+   PDF exports, bill printouts, and the user interface MAY NOT be removed,
+   altered, replaced, or obscured in any redistribution or modified version
+   of this Software. This includes but is not limited to:
+   - Invoice headers and footers
+   - PDF watermarks and document footers
+   - Application title bars and splash screens
+   - About dialogs
+
+3. SUBLICENSING & RESALE
+   You may NOT sublicense, sell, or commercially redistribute this Software
+   as a standalone product without explicit written permission from
+   Nexuzy Lab and David (DevilOne).
+
+4. MODIFICATIONS
+   You may modify the Software for personal or internal business use.
+   Modified versions must clearly state that they are derived from
+   "Hype ERP by Nexuzy Lab" and must retain all attribution in condition 1.
+
+5. OPEN SOURCE CONTRIBUTIONS
+   Contributions submitted to the official repository are accepted under
+   the same license terms and become property of Nexuzy Lab with full
+   credit given to the contributor.
+
+-------------------------------------------------------------------------------
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT. IN NO EVENT SHALL
+NEXUZY LAB, DAVID (DEVILONE), OR ANY CONTRIBUTORS BE LIABLE FOR ANY CLAIM,
+DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE
+USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+-------------------------------------------------------------------------------
+
+For permissions beyond the scope of this license, contact:
+  GitHub:  https://github.com/david0154
+  Project: https://github.com/david0154/hype-billing-system
+
+  "Built with passion by Nexuzy Lab & David (DevilOne)"

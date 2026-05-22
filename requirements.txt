@@ -1,0 +1,15 @@
+# Hype ERP Requirements
+ttkthemes>=3.2.2
+reportlab>=3.6.0
+pillow>=9.0.0
+requests>=2.28.0
+firebase-admin>=6.0.0
+pyrebase4>=4.7.1
+qrcode>=7.3.1
+openpyxl>=3.0.10
+pandas>=1.5.0
+matplotlib>=3.6.0
+cryptography>=38.0.0
+python-dateutil>=2.8.2
+barcode>=1.0.0
+fpdf2>=2.7.0

@@ -1,0 +1,98 @@
+[
+  {
+    "type": "backup_products",
+    "collection": "store_1",
+    "doc_id": "products",
+    "data": {
+      "error": "Timeout of 60.0s exceeded, last exception: 503 DNS resolution failed for firestore.googleapis.com: UNAVAILABLE: getaddrinfo: WSA Error (No such host is known.\r\n -- 11001)"
+    },
+    "timestamp": "2025-12-25T15:11:02.787456",
+    "synced": false
+  },
+  {
+    "type": "backup",
+    "collection": "products",
+    "doc_id": "store_C:\\Users\\Manoj Konark\\Downloads\\hype-billing-system-main (1)\\hype-billing-system-main\\serviceAccountKey.json",
+    "data": {
+      "status": "queued"
+    },
+    "timestamp": "2026-05-22T15:32:55.434832",
+    "synced": false
+  },
+  {
+    "type": "backup_bills",
+    "collection": "store_C:\\Users\\Manoj Konark\\Downloads\\hype-billing-system-main (1)\\hype-billing-system-main\\serviceAccountKey.json",
+    "doc_id": "bills",
+    "data": {},
+    "timestamp": "2026-05-22T15:32:55.464089",
+    "synced": false
+  },
+  {
+    "type": "backup_customers",
+    "collection": "store_C:\\Users\\Manoj Konark\\Downloads\\hype-billing-system-main (1)\\hype-billing-system-main\\serviceAccountKey.json",
+    "doc_id": "customers",
+    "data": {},
+    "timestamp": "2026-05-22T15:32:55.477609",
+    "synced": false
+  },
+  {
+    "type": "backup_users",
+    "collection": "users",
+    "doc_id": "all",
+    "data": {},
+    "timestamp": "2026-05-22T15:32:55.496386",
+    "synced": false
+  },
+  {
+    "type": "backup_settings",
+    "collection": "system",
+    "doc_id": "settings",
+    "data": {},
+    "timestamp": "2026-05-22T15:32:55.510305",
+    "synced": false
+  },
+  {
+    "type": "backup_gst_config",
+    "collection": "system",
+    "doc_id": "gst_config",
+    "data": {},
+    "timestamp": "2026-05-22T15:32:55.525606",
+    "synced": false
+  },
+  {
+    "type": "backup",
+    "collection": "products",
+    "doc_id": "store_1",
+    "data": {
+      "status": "queued"
+    },
+    "timestamp": "2026-05-22T17:26:44.888151",
+    "synced": false
+  },
+  {
+    "type": "backup_bills",
+    "collection": "store_1",
+    "doc_id": "bills",
+    "data": {},
+    "timestamp": "2026-05-22T17:26:44.900373",
+    "synced": false
+  },
+  {
+    "type": "backup_customers",
+    "collection": "store_1",
+    "doc_id": "customers",
+    "data": {},
+    "timestamp": "2026-05-22T17:26:44.912617",
+    "synced": false
+  },
+  {
+    "type": "backup_users",
+    "collection": "system",
+    "doc_id": "users",
+    "data": {
+      "error": "no such column: user_id"
+    },
+    "timestamp": "2026-05-22T18:59:40.399933",
+    "synced": false
+  }
+]
