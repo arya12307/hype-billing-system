@@ -831,93 +831,135 @@ python -c "from ai_assistant import auto_download_and_install, AVAILABLE_MODELS;
 pip install pyinstaller
 ```
 
-### Step 2 — Encrypt Firebase key first
+### Step 2 — Prepare Firebase credentials
+
+If you have a raw Firebase key, place `serviceAccountKey.json` in the project root and run:
 
 ```cmd
 python encrypt_key.py
 ```
 
-This creates `serviceAccountKey.enc` in the project root.
+This creates `serviceAccountKey.enc` in the project root. The packaged EXE uses `serviceAccountKey.enc` automatically. You do **not** need to enter the key manually inside the app.
+
+> If `serviceAccountKey.json` is not present, the build script will skip encryption and the EXE will run without Firebase cloud sync.
 
 ### Step 3 — Build the EXE
 
 **Option A — PowerShell script (recommended, one click):**
 
-In VS Code terminal, switch to PowerShell:
+From the project root in PowerShell:
+
 ```powershell
-powershell
-.\build_pyinstaller.ps1
+./build_pyinstaller.ps1
 ```
 
 The script automatically:
 1. 🗑️ Cleans old `dist/` and `build/` folders
-2. 🔐 Runs `encrypt_key.py`
-3. 🔨 Runs PyInstaller with all correct flags for all 19 modules
-4. ✅ Reports success + file size
+2. 🔐 Runs `encrypt_key.py` when `serviceAccountKey.json` exists
+3. 🔨 Runs `python -m PyInstaller` with the correct flags for the app modules
+4. ✅ Reports success and the output file size
 
-**Option B — Manual command (CMD):**
+**Option B — Manual command (recommended when you want full control):**
 
-```cmd
-pyinstaller --onefile --windowed --icon=icon.ico ^
-  --name="HypeERP" ^
-  --add-data "icon.ico;." ^
-  --add-data "logo.png;." ^
-  --add-data "modules;modules" ^
-  --hidden-import "modules.account" ^
-  --hidden-import "modules.account_invoice" ^
-  --hidden-import "modules.account_asset" ^
-  --hidden-import "modules.account_tax" ^
-  --hidden-import "modules.account_statement" ^
-  --hidden-import "modules.sale" ^
-  --hidden-import "modules.purchase" ^
-  --hidden-import "modules.stock" ^
-  --hidden-import "modules.production" ^
-  --hidden-import "modules.hr_module" ^
-  --hidden-import "modules.payroll_module" ^
-  --hidden-import "modules.crm_module" ^
-  --hidden-import "modules.projects_module" ^
-  --hidden-import "modules.timesheet" ^
-  --hidden-import "modules.pos_module" ^
-  --hidden-import "modules.stock_package" ^
-  --hidden-import "modules.quality_control" ^
-  --hidden-import "modules.marketing" ^
-  --hidden-import "modules.reporting_module" ^
-  --hidden-import "modules.erp_main_menu" ^
-  --hidden-import "modules.mode_selector" ^
-  --hidden-import "modules.scrollable_frame" ^
-  --hidden-import "modules.firebase_settings_ui" ^
-  --hidden-import "firebase_config" ^
-  --hidden-import "firebase_admin" ^
-  --hidden-import "firebase_admin.credentials" ^
-  --hidden-import "firebase_admin.firestore" ^
-  --hidden-import "google.cloud.firestore" ^
-  --hidden-import "google.auth" ^
-  --hidden-import "google.oauth2.service_account" ^
-  --hidden-import "reportlab.pdfgen" ^
-  --hidden-import "reportlab.lib.pagesizes" ^
-  --hidden-import "reportlab.platypus" ^
-  --hidden-import "PIL._tkinter_finder" ^
-  --hidden-import "cryptography.fernet" ^
-  --hidden-import "sklearn.utils._cython_blas" ^
-  --hidden-import "sklearn.neighbors._partition_nodes" ^
-  --hidden-import "sklearn.tree._utils" ^
-  --hidden-import "joblib" ^
-  --hidden-import "numpy" ^
-  --hidden-import "pandas" ^
-  --collect-all "firebase_admin" ^
-  --collect-all "google.cloud.firestore" ^
-  --collect-all "google.auth" ^
-  --collect-all "reportlab" ^
-  --collect-all "sklearn" ^
+```powershell
+python -m PyInstaller --onefile --windowed --icon=icon.ico `
+  --name=HypeERP `
+  --add-data "icon.ico;." `
+  --add-data "logo.png;." `
+  --add-data "modules;modules" `
+  --add-data "firebase_runtime_config.json;." `
+  --add-data "serviceAccountKey.enc;." `
+  --hidden-import "modules.account" `
+  --hidden-import "modules.account_invoice" `
+  --hidden-import "modules.account_asset" `
+  --hidden-import "modules.account_tax" `
+  --hidden-import "modules.account_statement" `
+  --hidden-import "modules.sale" `
+  --hidden-import "modules.purchase" `
+  --hidden-import "modules.stock" `
+  --hidden-import "modules.production" `
+  --hidden-import "modules.hr_module" `
+  --hidden-import "modules.payroll_module" `
+  --hidden-import "modules.crm_module" `
+  --hidden-import "modules.projects_module" `
+  --hidden-import "modules.timesheet" `
+  --hidden-import "modules.pos_module" `
+  --hidden-import "modules.stock_package" `
+  --hidden-import "modules.quality_control" `
+  --hidden-import "modules.marketing" `
+  --hidden-import "modules.reporting_module" `
+  --hidden-import "modules.erp_main_menu" `
+  --hidden-import "modules.mode_selector" `
+  --hidden-import "modules.scrollable_frame" `
+  --hidden-import "modules.erp_branding" `
+  --hidden-import "modules.inventory_analysis" `
+  --hidden-import "sklearn.utils._cython_blas" `
+  --hidden-import "sklearn.utils._typedefs" `
+  --hidden-import "sklearn.utils._heap" `
+  --hidden-import "sklearn.utils._sorting" `
+  --hidden-import "sklearn.utils._vector_sentinel" `
+  --hidden-import "sklearn.neighbors.typedefs" `
+  --hidden-import "sklearn.neighbors._partition_nodes" `
+  --hidden-import "sklearn.tree._utils" `
+  --hidden-import "sklearn.tree._criterion" `
+  --hidden-import "sklearn.tree._splitter" `
+  --hidden-import "sklearn.ensemble._forest" `
+  --hidden-import "sklearn.linear_model._base" `
+  --hidden-import "firebase_admin" `
+  --hidden-import "firebase_admin.credentials" `
+  --hidden-import "firebase_admin.firestore" `
+  --hidden-import "firebase_admin.auth" `
+  --hidden-import "firebase_admin.storage" `
+  --hidden-import "google.cloud.firestore" `
+  --hidden-import "google.cloud.firestore_v1" `
+  --hidden-import "google.auth" `
+  --hidden-import "google.auth.credentials" `
+  --hidden-import "google.oauth2" `
+  --hidden-import "google.oauth2.credentials" `
+  --hidden-import "google.oauth2.service_account" `
+  --hidden-import "reportlab.pdfgen" `
+  --hidden-import "reportlab.pdfgen.canvas" `
+  --hidden-import "reportlab.lib.pagesizes" `
+  --hidden-import "reportlab.lib.styles" `
+  --hidden-import "reportlab.lib.units" `
+  --hidden-import "reportlab.platypus" `
+  --hidden-import "PIL._tkinter_finder" `
+  --hidden-import "PIL.Image" `
+  --hidden-import "PIL.ImageTk" `
+  --hidden-import "cryptography.fernet" `
+  --hidden-import "joblib" `
+  --hidden-import "numpy" `
+  --hidden-import "pandas" `
+  --hidden-import "pandas._libs.tslibs.np_datetime" `
+  --hidden-import "pandas._libs.tslibs.nattype" `
+  --hidden-import "pandas._libs.tslibs.timedeltas" `
+  --hidden-import "pandas._libs.skiplist" `
+  --hidden-import "sqlite3" `
+  --hidden-import "json" `
+  --hidden-import "tkinter" `
+  --hidden-import "tkinter.ttk" `
+  --hidden-import "tkinter.messagebox" `
+  --hidden-import "tkinter.filedialog" `
+  --hidden-import "tkinter.simpledialog" `
+  --collect-all "firebase_admin" `
+  --collect-all "google.cloud.firestore" `
+  --collect-all "google.auth" `
+  --collect-all "reportlab" `
+  --collect-all "sklearn" `
   main.py
 ```
 
 ### Step 4 — Find your EXE
 
-After build completes (3–7 minutes):
-```
+After build completes:
+
+```text
 dist\HypeERP.exe   ← your distributable EXE
 ```
+
+### Step 5 — Runtime note for Firebase
+
+The app reads `serviceAccountKey.enc` automatically when it is present next to the EXE. You do **not** need to type or paste the key anywhere in the app or installer UI.
 
 ### Important Rules
 

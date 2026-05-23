@@ -626,6 +626,7 @@ class TallyWindow:
                 c2.execute("INSERT INTO journal_entries(entry_date,voucher_type,voucher_no,narration) VALUES(?,?,?,?)",
                            (date_v.get(), vtype_v.get(), vno_v.get(), nar_v.get()))
                 jid = c2.lastrowid
+                conn2.commit()
                 for ldgr, dr, cr in [(dr_var.get(), float(dr_amt.get() or 0), 0),
                                       (cr_var.get(), 0, float(cr_amt.get() or 0))]:
                     if ldgr:

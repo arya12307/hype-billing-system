@@ -55,6 +55,12 @@ class AccountTaxModule:
                         tags=('zero',) if r['IGST']==0 else ())
         tree.tag_configure('zero', foreground='#2ecc71')
 
+        # Info section about HSN codes
+        info_frame = tk.Frame(win, bg=BG2, pady=8)
+        info_frame.pack(fill='x', padx=12, pady=(8, 0))
+        tk.Label(info_frame, text='💡 TIP: Each category should have an HSN code assigned for GST compliance.',
+                 bg=BG2, fg='#2ecc71', font=('Arial', 9, 'italic')).pack(anchor='w', padx=8)
+
         # Buttons for Edit and Delete
         btn_frame = tk.Frame(win, bg=BG)
         btn_frame.pack(fill='x', padx=12, pady=6)
@@ -87,6 +93,8 @@ class AccountTaxModule:
                   command=edit_tax, padx=12, pady=5).pack(side='left', padx=4)
         tk.Button(btn_frame, text='🗑 Delete Selected', bg='#e74c3c', fg=FG, relief='flat',
                   command=delete_tax, padx=12, pady=5).pack(side='left', padx=4)
+        tk.Button(btn_frame, text='🔧 Manage HSN Codes', bg='#f39c12', fg=FG, relief='flat',
+                  command=self._open_hsn_config, padx=12, pady=5).pack(side='left', padx=4)
 
         # Summary
         sf = tk.Frame(win, bg=BG2, pady=6); sf.pack(fill='x', padx=12)
@@ -169,3 +177,14 @@ class AccountTaxModule:
                 messagebox.showerror('Error', 'Please enter valid numbers for tax rates')
         
         tk.Button(d, text='Save', bg=ACC, fg=FG, relief='flat', command=save, padx=14, pady=6).pack(pady=12)
+    
+    def _open_hsn_config(self):
+        """Open HSN Code Configuration Module"""
+        try:
+            from modules.hsn_config import HSNConfigModule
+            hsn_module = HSNConfigModule(self.parent, self.db_path)
+            hsn_module.open()
+        except ImportError:
+            messagebox.showerror('Error', 'HSN Configuration module not found.')
+        except Exception as e:
+            messagebox.showerror('Error', f'Failed to open HSN Configuration: {str(e)}')

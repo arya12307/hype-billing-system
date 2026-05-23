@@ -1,8 +1,9 @@
 # Hype ERP - Accounting Module (account)
 import tkinter as tk
 from tkinter import ttk, messagebox
-import sqlite3
 import datetime
+import os
+import sqlite3
 from modules.erp_branding import HYPE_ERP_BRAND
 from modules.window_utils import set_icon
 
@@ -13,8 +14,27 @@ class AccountingModule:
 
     def __init__(self, parent, db_path="hype_billing_system.db"):
         self.parent = parent
-        self.db_path = db_path
+        self.db_path = self._resolve_db_path(db_path)
         self._init_db()
+
+    def _resolve_db_path(self, db_path):
+        if os.path.isabs(db_path):
+            return db_path
+
+        candidates = [
+            os.path.abspath(db_path),
+            os.path.join(os.path.dirname(os.path.dirname(__file__)), db_path),
+            os.path.join(os.path.dirname(__file__), '..', db_path),
+        ]
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                return candidate
+        return os.path.abspath(candidates[0])
+
+    def _ensure_column(self, conn, table_name, column_name, column_def):
+        existing_cols = [row[1] for row in conn.execute(f"PRAGMA table_info({table_name})")]
+        if column_name not in existing_cols:
+            conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_def}")
 
     def _init_db(self):
         conn = sqlite3.connect(self.db_path)
@@ -37,8 +57,36 @@ class AccountingModule:
             amount REAL NOT NULL,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )""")
+        self._ensure_column(conn, 'journal_entries', 'date', 'date TEXT NOT NULL DEFAULT CURRENT_DATE')
+        self._ensure_column(conn, 'journal_entries', 'ref', 'ref TEXT')
+        self._ensure_column(conn, 'journal_entries', 'description', 'description TEXT')
+        self._ensure_column(conn, 'journal_entries', 'debit_account', 'debit_account TEXT')
+        self._ensure_column(conn, 'journal_entries', 'credit_account', 'credit_account TEXT')
+        self._ensure_column(conn, 'journal_entries', 'amount', 'amount REAL NOT NULL DEFAULT 0.0')
+        self._ensure_column(conn, 'journal_entries', 'created_at', 'created_at TEXT DEFAULT CURRENT_TIMESTAMP')
         conn.commit()
         conn.close()
+
+    def _get_store_id(self):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            row = conn.execute("SELECT value FROM settings WHERE key='store_id'").fetchone()
+            conn.close()
+            return int(row[0]) if row and str(row[0]).isdigit() else 1
+        except Exception:
+            return 1
+
+    def _sync_account_tables(self):
+        try:
+            from firebase_sync import get_firebase_sync_manager
+            fsm = get_firebase_sync_manager()
+            if not fsm or not getattr(fsm, 'db', None):
+                return
+            store_id = self._get_store_id()
+            fsm.sync_table_to_firestore('accounts', f'stores/{store_id}/accounts')
+            fsm.sync_table_to_firestore('journal_entries', f'stores/{store_id}/journal_entries')
+        except Exception:
+            pass
 
     def open(self):
         win = tk.Toplevel(self.parent)
@@ -113,6 +161,7 @@ class AccountingModule:
                 conn.commit()
                 conn.close()
                 self._refresh_accounts(tree)
+                self._sync_account_tables()
                 d.destroy()
             except Exception as e:
                 messagebox.showerror("Error", str(e))
@@ -162,6 +211,7 @@ class AccountingModule:
                 conn.commit()
                 conn.close()
                 self._refresh_journal(tree)
+                self._sync_account_tables()
                 d.destroy()
             except Exception as e:
                 messagebox.showerror("Error", str(e))

@@ -1,11 +1,13 @@
 # Hype ERP - Vendor Management Module
 # Comprehensive vendor master data management
+# ✅ CONNECTED TO DATA SERVICE - All vendor data now shared
 import tkinter as tk
 from tkinter import ttk, messagebox
 import sqlite3
 from datetime import date
 from modules.scrollable_frame import ScrollableFrame
 from modules.window_utils import set_icon
+from modules.data_service import get_data_service
 
 BG = '#1a1a2e'
 BG2 = '#16213e'
@@ -14,52 +16,10 @@ FG = 'white'
 FOOTER = 'Powered by Hype ERP v3.0.0'
 
 def _init_db(db_path):
-    """Initialize vendor tables"""
-    conn = sqlite3.connect(db_path)
-    c = conn.cursor()
-    c.executescript("""
-        CREATE TABLE IF NOT EXISTS vendors (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL,
-            company TEXT,
-            email TEXT,
-            phone TEXT,
-            address TEXT,
-            city TEXT,
-            state TEXT,
-            postal_code TEXT,
-            gstin TEXT,
-            pan TEXT,
-            bank_account TEXT,
-            bank_name TEXT,
-            ifsc_code TEXT,
-            credit_limit REAL DEFAULT 0.0,
-            payment_terms INTEGER DEFAULT 30,
-            tax_id TEXT,
-            contact_person TEXT,
-            contact_phone TEXT,
-            notes TEXT,
-            status TEXT DEFAULT 'Active',
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS vendor_bills (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            bill_number TEXT UNIQUE,
-            vendor_id INTEGER,
-            bill_date TEXT,
-            due_date TEXT,
-            amount REAL DEFAULT 0.0,
-            paid_amount REAL DEFAULT 0.0,
-            status TEXT DEFAULT 'Pending',
-            payment_method TEXT,
-            payment_date TEXT,
-            notes TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        );
-    """)
-    conn.commit()
-    conn.close()
+    """Initialize vendor tables via DataService"""
+    # DataService creates the shared vendors table
+    data_service = get_data_service(db_path)
+    return data_service
 
 class VendorModule:
     MODULE_NAME = "Vendor Management"
@@ -69,7 +29,8 @@ class VendorModule:
         self.parent = parent
         self.db_path = db_path
         self.vendor_var = tk.StringVar()
-        _init_db(db_path)
+        self.data_service = _init_db(db_path)
+        self.data_service.register_module(self.MODULE_NAME, self.MODULE_CODE)
 
     def open(self):
         """Open vendor management window"""
@@ -331,7 +292,7 @@ class VendorModule:
                 messagebox.showerror('Error', str(e))
 
     def _view_vendor_bills(self, parent, tree):
-        """View vendor bills"""
+        """View vendor bills from purchase orders"""
         sel = tree.selection()
         if not sel:
             messagebox.showwarning('Select', 'Select a vendor to view bills.')
@@ -342,21 +303,24 @@ class VendorModule:
         
         d = tk.Toplevel(parent)
         d.title(f'Vendor Bills: {vendor_name}')
-        d.geometry('900x500')
+        d.geometry('1000x550')
         d.configure(bg=BG)
         set_icon(d)
         
-        tk.Label(d, text=f'📋 Bills for {vendor_name}', bg=BG2, fg=ACC,
-                 font=('Arial', 12, 'bold')).pack(fill='x', ipady=8)
+        # Header
+        hdr = tk.Frame(d, bg=BG2)
+        hdr.pack(fill='x', ipady=8)
+        tk.Label(hdr, text=f'📋 Purchase Bills - {vendor_name}', bg=BG2, fg=ACC,
+                 font=('Arial', 12, 'bold')).pack(side='left', padx=16, pady=8)
         
-        cols = ('Bill #', 'Date', 'Due Date', 'Amount', 'Paid', 'Status', 'Payment Method')
+        cols = ('PO#', 'Date', 'Amount', 'Status', 'Notes')
         frame = tk.Frame(d, bg=BG)
         frame.pack(fill='both', expand=True, padx=12, pady=8)
         
         tree_bills = ttk.Treeview(frame, columns=cols, show='headings', height=15)
-        for col, width in zip(cols, [100, 80, 80, 80, 80, 80, 100]):
+        for col, width in zip(cols, [120, 100, 120, 100, 300]):
             tree_bills.heading(col, text=col)
-            tree_bills.column(col, width=width, anchor='center' if col != 'Bill #' else 'w')
+            tree_bills.column(col, width=width, anchor='center' if col != 'Notes' else 'w')
         
         sb = ttk.Scrollbar(frame, orient='vertical', command=tree_bills.yview)
         tree_bills.configure(yscroll=sb.set)
@@ -366,13 +330,30 @@ class VendorModule:
         try:
             conn = sqlite3.connect(self.db_path)
             c = conn.cursor()
-            c.execute("""SELECT bill_number, bill_date, due_date, amount, paid_amount, status, payment_method
-                       FROM vendor_bills WHERE vendor_id = ? ORDER BY bill_date DESC""", (vendor_id,))
+            # Query from purchase_orders table
+            c.execute("""SELECT po_number, date, total, status, notes
+                       FROM purchase_orders WHERE vendor_id = ? ORDER BY date DESC""", (vendor_id,))
             for row in c.fetchall():
-                tag = 'paid' if row[5] == 'Paid' else 'pending'
-                tree_bills.insert('', 'end', values=row, tags=(tag,))
-            tree_bills.tag_configure('paid', foreground='#2ecc71')
-            tree_bills.tag_configure('pending', foreground='#f39c12')
+                tag = 'received' if row[3] == 'Received' else 'pending'
+                amount_str = f'₹{float(row[2]):.2f}' if row[2] else '₹0.00'
+                tree_bills.insert('', 'end', values=(row[0], row[1], amount_str, row[3], row[4] or ''), tags=(tag,))
+            tree_bills.tag_configure('received', foreground='#2ecc71', background='#0a2a0a')
+            tree_bills.tag_configure('pending', foreground='#f39c12', background='#2a2a0a')
             conn.close()
         except Exception as e:
-            messagebox.showerror('Error', str(e))
+            messagebox.showerror('Error', f'Error loading bills: {str(e)}')
+        
+        # Summary footer
+        footer = tk.Frame(d, bg=BG2)
+        footer.pack(fill='x', pady=6)
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute("""SELECT COUNT(*), SUM(total) FROM purchase_orders WHERE vendor_id = ?""", (vendor_id,))
+            count, total = c.fetchone()
+            total_str = f'₹{float(total):.2f}' if total else '₹0.00'
+            tk.Label(footer, text=f'Total Bills: {count} | Total Amount: {total_str}', 
+                    bg=BG2, fg=ACC, font=('Arial', 10, 'bold')).pack(padx=16, pady=4)
+            conn.close()
+        except:
+            pass

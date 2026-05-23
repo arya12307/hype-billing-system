@@ -108,6 +108,11 @@ class BillingWindow:
         search_entry.pack(side='left', fill='x', expand=True, ipady=7)
         self.search_var.trace_add('write', lambda *a: self._refresh_products())
         search_entry.focus_set()
+        
+        # Add manual entry button
+        Button(search_frame, text='➕ Manual', bg='#e94560', fg='white',
+               relief='flat', font=('Segoe UI', 9, 'bold'),
+               command=self._manual_product_entry, padx=8).pack(side='left', padx=(4, 0), ipady=6)
 
         # Product treeview
         style = ttk.Style()
@@ -292,6 +297,73 @@ class BillingWindow:
 
     def _status(self, msg):
         self.status_var.set(msg)
+    
+    def _manual_product_entry(self):
+        """Manually add a product not in database"""
+        d = Toplevel(self.win)
+        d.title('Manual Product Entry')
+        d.geometry('400x350')
+        d.configure(bg='#0d0d1a')
+        
+        Label(d, text='Add Product Manually', bg='#16213e', fg='#e94560',
+              font=('Segoe UI', 12, 'bold')).pack(fill='x', ipady=8)
+        
+        fields = {}
+        for lbl, key, default in [
+            ('Product Name *', 'name', ''),
+            ('Selling Price *', 'price', '0.00'),
+            ('Quantity', 'qty', '1'),
+            ('GST Rate (%)', 'gst', '18'),
+            ('Category', 'category', ''),
+        ]:
+            Frame(d, bg='#0d0d1a', height=1).pack(pady=2)
+            Label(d, text=lbl, bg='#0d0d1a', fg='#aaaacc',
+                  font=('Segoe UI', 9)).pack(anchor='w', padx=16)
+            var = StringVar(value=default)
+            Entry(d, textvariable=var, bg='#1e1e3a', fg='white',
+                  font=('Segoe UI', 10), relief='flat', bd=2).pack(fill='x', padx=16, ipady=5)
+            fields[key] = var
+        
+        def save():
+            name = fields['name'].get().strip()
+            try:
+                price = float(fields['price'].get())
+                qty = int(fields['qty'].get())
+                gst = float(fields['gst'].get())
+            except ValueError:
+                messagebox.showerror('Input Error', 'Enter valid numbers', parent=d)
+                return
+            
+            if not name or price <= 0 or qty <= 0:
+                messagebox.showwarning('Input Error', 'Name and price required', parent=d)
+                return
+            
+            category = fields['category'].get().strip() or 'Manual Entry'
+            
+            # Add to cart
+            for item in self.cart:
+                if item['name'].lower() == name.lower():
+                    item['qty'] += qty
+                    self._refresh_cart()
+                    d.destroy()
+                    self._status(f'Updated: {name}')
+                    return
+            
+            self.cart.append({
+                'name': name, 'price': price, 'qty': qty, 'gst': gst,
+                'stock': qty, 'category': category, 'sku': 'MANUAL', 'product_id': 0
+            })
+            self._refresh_cart()
+            d.destroy()
+            self._status(f'Added manually: {name}')
+        
+        Frame(d, bg='#0d0d1a', height=8).pack()
+        Button(d, text='Add to Cart', bg='#00d4ff', fg='#0d0d1a',
+               relief='flat', font=('Segoe UI', 10, 'bold'),
+               command=save, padx=16).pack(ipady=7)
+        Button(d, text='Cancel', bg='#44444d', fg='white',
+               relief='flat', font=('Segoe UI', 9),
+               command=d.destroy, padx=16).pack(ipady=6, pady=(4, 10))
 
     # ----------------------------------------------------------------- CART OPS
     def _add_selected(self):
@@ -514,15 +586,45 @@ class BillingWindow:
         try:
             conn = sqlite3.connect(self.DB)
             c = conn.cursor()
+            
+            # ✅ Save/Update customer in customers table
+            cust_name = self.cust_name.get().strip()
+            cust_phone = self.cust_phone.get().strip()
+            cust_gstin = self.cust_gstin.get().strip()
+            
+            if cust_name:  # Only save if customer name exists
+                c.execute("""
+                    SELECT id, total_purchases, visit_count FROM customers 
+                    WHERE phone = ? AND name = ?
+                """, (cust_phone, cust_name))
+                existing = c.fetchone()
+                
+                if existing:
+                    # Update existing customer
+                    cust_id, prev_purchases, prev_visits = existing
+                    c.execute("""
+                        UPDATE customers 
+                        SET total_purchases = ?, visit_count = ? 
+                        WHERE id = ?
+                    """, (prev_purchases + grand, prev_visits + 1, cust_id))
+                else:
+                    # Create new customer
+                    c.execute("""
+                        INSERT INTO customers 
+                        (name, phone, email, gstin, total_purchases, visit_count)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (cust_name, cust_phone, '', cust_gstin, grand, 1))
+            
             c.execute("""
                 INSERT INTO invoices
                 (invoice_number, date, customer_name, customer_phone, customer_gstin,
                  subtotal, gst_amount, discount, total_amount, payment_method, created_by)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?)
-            """, (inv_no, today, self.cust_name.get(), self.cust_phone.get(),
-                   self.cust_gstin.get(), subtotal, total_gst, disc_amt, grand,
+            """, (inv_no, today, cust_name, cust_phone,
+                   cust_gstin, subtotal, total_gst, disc_amt, grand,
                    pay, self.current_user))
             inv_id = c.lastrowid
+            conn.commit()
             for item in self.cart:
                 gst_amt = round(item['price'] * item['qty'] * item['gst'] / 100, 2)
                 total = round(item['price'] * item['qty'] + gst_amt, 2)
@@ -536,24 +638,64 @@ class BillingWindow:
                           (item['qty'], today, item['name']))
             conn.commit()
             conn.close()
+            
             # Immediate sync to Firebase: invoices, invoice_items, products (stock updates)
             try:
-                import firebase_sync
-                fsm = getattr(firebase_sync, 'firebase_sync_manager', None)
+                from firebase_sync import get_firebase_sync_manager, trigger_immediate_sync, sync_all_data_immediately, queue_operation_if_offline, process_offline_queue
+                import logging as logging_module
+                logger_sync = logging_module.getLogger(__name__)
+                
+                fsm = get_firebase_sync_manager()
+                try:
+                    store_id = int(self.get_setting('store_id', '1'))
+                except Exception:
+                    try: store_id = int(get_setting('store_id', '1'))
+                    except Exception: store_id = 1
+                
                 if fsm and getattr(fsm, 'db', None):
                     try:
-                        store_id = int(self.get_setting('store_id', '1'))
-                    except Exception:
-                        try: store_id = int(get_setting('store_id', '1'))
-                        except Exception: store_id = 1
-                    try:
+                        # Try to sync immediately
+                        logger_sync.info(f'📤 Syncing new bill {inv_no} to Firebase (store_id={store_id})')
                         fsm.sync_table_to_firestore('invoices', f'stores/{store_id}/invoices')
                         fsm.sync_table_to_firestore('invoice_items', f'stores/{store_id}/invoice_items')
                         fsm.sync_table_to_firestore('products', f'stores/{store_id}/products')
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+                        logger_sync.info(f'✅ Bill {inv_no} synced to Firebase successfully')
+                        
+                        # Process any queued operations from when internet was offline
+                        try:
+                            processed = process_offline_queue()
+                            if processed > 0:
+                                logger_sync.info(f'📤 Processed {processed} queued operations')
+                        except Exception as e:
+                            logger_sync.warning(f'Could not process offline queue: {e}')
+                        
+                        # Trigger immediate sync in background thread
+                        trigger_immediate_sync(store_id)
+                    except Exception as e:
+                        logger_sync.error(f'❌ Error syncing bill {inv_no} to Firebase: {str(e)}')
+                        # Queue this operation for later
+                        try:
+                            queue_operation_if_offline('create_invoice', {
+                                'invoice_no': inv_no,
+                                'total_amount': grand,
+                                'date': str(today)
+                            }, store_id)
+                        except Exception as qe:
+                            logger_sync.warning(f'Could not queue operation: {qe}')
+                else:
+                    logger_sync.warning(f'Firebase sync manager not available for bill {inv_no}')
+                    # Queue operation for when Firebase comes online
+                    try:
+                        queue_operation_if_offline('create_invoice', {
+                            'invoice_no': inv_no,
+                            'total_amount': grand,
+                            'date': str(today)
+                        }, store_id)
+                    except Exception as e:
+                        logger_sync.warning(f'Could not queue operation: {e}')
+            except Exception as e:
+                import logging as logging_module
+                logging_module.getLogger(__name__).warning(f'Firebase import error: {str(e)}')
         except Exception as e:
             messagebox.showerror('DB Error', str(e), parent=self.win)
             return
@@ -611,8 +753,8 @@ class BillingWindow:
             line(f'  {item["name"][:22]:<22} {item["qty"]:>4} {item["price"]:>8.2f} {amt:>9.2f}')
             cat = item.get('category', '').replace('|', '-')[:10]
             sku = item.get('sku', '')[:10]
-            gst = item.get('gst', 0)
-            line(f'  {f"[{cat} | {sku}]":<22} {"":>4} {gst:>8.1f} {"":>9}')
+            gst_rate = item.get('gst', 0)
+            line(f'  {f"[{cat} | {sku}]":<22} {"":>4} {gst_rate:>8.1f} {"":>9}')
         line('-' * 50)
         line(f'  {"Subtotal":<30} {CURRENCY}{subtotal:>10.2f}')
         line(f'  {"GST (SGST+CGST)":<30} {CURRENCY}{gst:>10.2f}')

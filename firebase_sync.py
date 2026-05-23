@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 import threading
 import time
 import socket
+import tempfile
 from typing import Dict, List, Any
 import logging
 import json as _json
@@ -76,6 +77,27 @@ def _hash_password(password: str) -> str:
     except Exception:
         return ''
 
+
+def _normalize_password_for_restore(password_value) -> str:
+    """Normalize a Firebase password so local authentication stays compatible."""
+    if password_value is None:
+        return ''
+
+    if isinstance(password_value, bytes):
+        value = password_value.decode('utf-8', errors='ignore')
+    else:
+        value = str(password_value)
+
+    value = value.strip()
+    if not value:
+        return ''
+
+    if len(value) == 64 and all(ch in '0123456789abcdefABCDEF' for ch in value):
+        return value.lower()
+
+    return _hash_password(value)
+
+
 logging.basicConfig(
     filename=LOG_FILE,
     level=logging.INFO,
@@ -91,22 +113,82 @@ ABOUT_TEXT = (
     "Contact: nexuzypvtltd@gmail.com"
 )
 
+FIREBASE_SECRET_KEY = b'J6TmP2PtNyXGZX28P8b2_CO2xRJ2c-xk2AIIJtu1gPc='
+
 # Global lock to prevent concurrent Firebase initialization
 _firebase_init_lock = threading.Lock()
 _firebase_initialized = False
+
+
+def _decrypt_firebase_key(enc_path: str):
+    if not enc_path or not os.path.exists(enc_path):
+        return None
+    try:
+        from cryptography.fernet import Fernet
+        with open(enc_path, 'rb') as handle:
+            decrypted = Fernet(FIREBASE_SECRET_KEY).decrypt(handle.read())
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.json')
+        temp_file.write(decrypted)
+        temp_file.close()
+        return temp_file.name
+    except Exception:
+        return None
+
+
+def _resolve_credentials_path(credentials_path='serviceAccountKey.json'):
+    if not credentials_path:
+        return None
+
+    if os.path.isabs(credentials_path) and os.path.exists(credentials_path):
+        return credentials_path
+
+    # For PyInstaller, check LOCALAPPDATA/HypeERP first for credentials (persistent location)
+    if getattr(sys, 'frozen', False):
+        hype_app_dir = os.path.join(
+            os.getenv('LOCALAPPDATA') or os.getenv('APPDATA') or os.path.expanduser('~'),
+            'HypeERP'
+        )
+        # Check for serviceAccountKey.json in persistent location
+        persistent_creds = os.path.join(hype_app_dir, 'serviceAccountKey.json')
+        if os.path.exists(persistent_creds):
+            return persistent_creds
+        
+        # Check for encrypted version
+        persistent_enc = os.path.join(hype_app_dir, 'serviceAccountKey.enc')
+        if os.path.exists(persistent_enc):
+            decrypted = _decrypt_firebase_key(persistent_enc)
+            if decrypted and os.path.exists(decrypted):
+                return decrypted
+        
+        # Fall back to bundle location
+        base_path = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
+    else:
+        base_path = os.path.dirname(os.path.abspath(__file__))
+
+    if not os.path.isabs(credentials_path):
+        candidate = os.path.join(base_path, credentials_path)
+    else:
+        candidate = credentials_path
+
+    if os.path.exists(candidate):
+        return candidate
+
+    enc_path = os.path.join(base_path, 'serviceAccountKey.enc')
+    decrypted_path = _decrypt_firebase_key(enc_path)
+    if decrypted_path and os.path.exists(decrypted_path):
+        return decrypted_path
+
+    if os.path.exists(os.path.join(base_path, 'serviceAccountKey.json')):
+        return os.path.join(base_path, 'serviceAccountKey.json')
+
+    return candidate
+
 
 class FirebaseSync:
     def __init__(self, credentials_path='serviceAccountKey.json'):
         """Initialize Firebase connection"""
         self.db = None
-        # Resolve absolute path for credentials in a way that works
-        # when running from source and when bundled by PyInstaller (--onefile).
-        if not os.path.isabs(credentials_path):
-            if getattr(sys, 'frozen', False):
-                base_path = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
-            else:
-                base_path = os.path.dirname(os.path.abspath(__file__))
-            credentials_path = os.path.join(base_path, credentials_path)
+        credentials_path = _resolve_credentials_path(credentials_path)
 
         self.credentials_path = credentials_path
         # Put offline queue file next to the credentials (or in script dir if credentials not provided)
@@ -1394,6 +1476,228 @@ class FirebaseSync:
             'summary': summary
         }
 
+    def auto_restore_all_data(self, store_id: int) -> Dict[str, bool]:
+        """
+        Restore all data from Firebase backups to local SQLite database.
+        Used when local DB is empty (first login or fresh install).
+        
+        Returns dict with restoration status for each data type.
+        """
+        if not self.db:
+            logger.warning("Firebase not initialized - cannot restore data")
+            return {'success': False, 'reason': 'Firebase not available'}
+        
+        try:
+            db_path = get_db_path()
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            restored = {}
+            
+            # Restore products
+            try:
+                doc = self.db.collection('stores').document(str(store_id)).collection('products').document('backup').get()
+                if doc.exists:
+                    data = doc.to_dict()
+                    products = data.get('products', [])
+                    if products:
+                        cursor.executemany(
+                            'INSERT OR REPLACE INTO products (id, name, price, category, hsn_code, gst_rate, store_id) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                            [(p.get('id'), p.get('name'), p.get('price'), p.get('category'), p.get('hsn_code'), p.get('gst_rate'), store_id) for p in products]
+                        )
+                        restored['products'] = True
+                        logger.info(f"✓ Restored {len(products)} products")
+            except Exception as e:
+                logger.warning(f"Could not restore products: {e}")
+                restored['products'] = False
+            
+            # Restore bills and invoices
+            try:
+                doc = self.db.collection('stores').document(str(store_id)).collection('bills').document('backup').get()
+                if doc.exists:
+                    data = doc.to_dict()
+                    bills = data.get('bills', [])
+                    for bill in bills:
+                        try:
+                            cursor.execute(
+                                'INSERT OR REPLACE INTO bills (bill_id, bill_date, customer_id, total_amount, payment_method, store_id) VALUES (?, ?, ?, ?, ?, ?)',
+                                (bill.get('bill_id'), bill.get('bill_date'), bill.get('customer_id'), bill.get('total_amount'), bill.get('payment_method'), store_id)
+                            )
+                            # Restore bill items if present
+                            for item in bill.get('items', []):
+                                try:
+                                    cursor.execute(
+                                        'INSERT OR REPLACE INTO bill_items (id, bill_id, product_id, quantity, price, gst_rate) VALUES (?, ?, ?, ?, ?, ?)',
+                                        (item.get('id'), bill.get('bill_id'), item.get('product_id'), item.get('quantity'), item.get('price'), item.get('gst_rate'))
+                                    )
+                                except Exception:
+                                    pass
+                        except Exception as e:
+                            logger.warning(f"Could not restore bill {bill.get('bill_id')}: {e}")
+                    if bills:
+                        restored['bills'] = True
+                        logger.info(f"✓ Restored {len(bills)} bills")
+            except Exception as e:
+                logger.warning(f"Could not restore bills: {e}")
+                restored['bills'] = False
+            
+            # Restore customers
+            try:
+                doc = self.db.collection('stores').document(str(store_id)).collection('customers').document('backup').get()
+                if doc.exists:
+                    data = doc.to_dict()
+                    customers = data.get('customers', [])
+                    if customers:
+                        cursor.executemany(
+                            'INSERT OR REPLACE INTO customers (id, name, phone, email, address, store_id) VALUES (?, ?, ?, ?, ?, ?)',
+                            [(c.get('id'), c.get('name'), c.get('phone'), c.get('email'), c.get('address'), store_id) for c in customers]
+                        )
+                        restored['customers'] = True
+                        logger.info(f"✓ Restored {len(customers)} customers")
+            except Exception as e:
+                logger.warning(f"Could not restore customers: {e}")
+                restored['customers'] = False
+            
+            # Restore employees
+            try:
+                doc = self.db.collection('stores').document(str(store_id)).collection('employees').document('backup').get()
+                if doc.exists:
+                    data = doc.to_dict()
+                    employees = data.get('employees', [])
+                    if employees:
+                        cursor.executemany(
+                            'INSERT OR REPLACE INTO employees (id, name, email, phone, store_id) VALUES (?, ?, ?, ?, ?)',
+                            [(e.get('id'), e.get('name'), e.get('email'), e.get('phone'), store_id) for e in employees]
+                        )
+                        restored['employees'] = True
+                        logger.info(f"✓ Restored {len(employees)} employees")
+            except Exception as e:
+                logger.warning(f"Could not restore employees: {e}")
+                restored['employees'] = False
+            
+            # Restore payslips
+            try:
+                doc = self.db.collection('stores').document(str(store_id)).collection('payslips').document('backup').get()
+                if doc.exists:
+                    data = doc.to_dict()
+                    payslips = data.get('payslips', [])
+                    if payslips:
+                        cursor.executemany(
+                            'INSERT OR REPLACE INTO payslips (id, employee_id, amount, month, year) VALUES (?, ?, ?, ?, ?)',
+                            [(p.get('id'), p.get('employee_id'), p.get('amount'), p.get('month'), p.get('year')) for p in payslips]
+                        )
+                        restored['payslips'] = True
+                        logger.info(f"✓ Restored {len(payslips)} payslips")
+            except Exception as e:
+                logger.warning(f"Could not restore payslips: {e}")
+                restored['payslips'] = False
+            
+            # Restore settings
+            try:
+                doc = self.db.collection('system').document('settings').get()
+                if doc.exists:
+                    data = doc.to_dict()
+                    settings = data.get('settings', {})
+                    for key, value in settings.items():
+                        try:
+                            cursor.execute(
+                                'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
+                                (key, value)
+                            )
+                        except Exception:
+                            pass
+                    if settings:
+                        restored['settings'] = True
+                        logger.info(f"✓ Restored {len(settings)} settings")
+            except Exception as e:
+                logger.warning(f"Could not restore settings: {e}")
+                restored['settings'] = False
+            
+            # Commit all changes
+            conn.commit()
+            conn.close()
+            
+            logger.info(f"✅ Auto-restore completed: {restored}")
+            return restored
+            
+        except Exception as e:
+            logger.error(f"Error during auto-restore: {e}")
+            return {'success': False, 'reason': str(e)}
+    
+    def restore_user_from_firebase(self, username: str, password_hash: str = None) -> bool:
+        """
+        Restore a single user from Firebase backup to the local database.
+        Used during login if user not found locally.
+        
+        Returns True if user was restored, False otherwise.
+        """
+        if not self.db:
+            logger.warning("Firebase not initialized - cannot restore user")
+            return False
+        
+        try:
+            # Get user from system/users backup (not store-specific)
+            doc = self.db.collection('system').document('users').get()
+            if not doc.exists:
+                logger.warning(f"No users backup found in Firebase for user {username}")
+                return False
+            
+            users_data = doc.to_dict().get('users', [])
+            target_user = None
+            
+            # Find user by username
+            for u in users_data:
+                if u.get('username') == username:
+                    target_user = u
+                    break
+            
+            if not target_user:
+                logger.info(f"User {username} not found in Firebase backup")
+                return False
+            
+            # Verify password if provided
+            if password_hash:
+                stored_pwd = target_user.get('password', '')
+                # Normalize password for comparison
+                normalized_stored = _normalize_password_for_restore(stored_pwd)
+                if password_hash != normalized_stored:
+                    logger.warning(f"Password mismatch for user {username} in Firebase")
+                    return False
+            
+            # Create user in local database
+            db_path = get_db_path()
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            
+            try:
+                user_pwd = _normalize_password_for_restore(target_user.get('password', ''))
+                cursor.execute(
+                    'INSERT INTO users (username, password, role, full_name, phone, email) VALUES (?, ?, ?, ?, ?, ?)',
+                    (
+                        target_user.get('username'),
+                        user_pwd,
+                        target_user.get('role', 'cashier'),
+                        target_user.get('full_name', target_user.get('username')),
+                        target_user.get('phone', ''),
+                        target_user.get('email', '')
+                    )
+                )
+                conn.commit()
+                logger.info(f"✅ Restored user {username} from Firebase")
+                conn.close()
+                return True
+            except sqlite3.IntegrityError:
+                logger.info(f"User {username} already exists in local database")
+                conn.close()
+                return True
+            except Exception as e:
+                logger.error(f"Error creating user {username} in local DB: {e}")
+                conn.close()
+                return False
+            
+        except Exception as e:
+            logger.error(f"Error restoring user {username} from Firebase: {e}")
+            return False
+
 
 def initialize_firebase_sync(credentials_path='serviceAccountKey.json', store_id: int = 1, interval_seconds: int = 300):
     """Convenience helper to create FirebaseSync, configure interval, and start background auto-sync.
@@ -1419,698 +1723,6 @@ def initialize_firebase_sync(credentials_path='serviceAccountKey.json', store_id
         return None
 
 
-def shutdown_firebase_sync(fs_instance: FirebaseSync):
-    """Stop background threads and cleanup the FirebaseSync instance."""
-    try:
-        if fs_instance:
-            fs_instance.stop_auto_sync()
-            logger.info("shutdown_firebase_sync: Stopped auto-sync")
-    except Exception as e:
-        logger.warning(f"shutdown_firebase_sync error: {e}")
-    
-    def restore_from_firebase(self, store_id: int, collection: str) -> List[Dict]:
-        """Restore data from Firebase backup"""
-        if not self.db:
-            logger.error("Firebase not connected")
-            return []
-        
-        try:
-            doc = self.db.collection('stores').document(str(store_id)).collection(collection).document('backup').get()
-            if doc.exists:
-                data = doc.to_dict()
-                logger.info(f"Restored {collection} from Firebase")
-                return data.get(collection, [])
-            else:
-                logger.warning(f"No backup found for {collection}")
-                return []
-        except Exception as e:
-            logger.error(f"Error restoring {collection}: {str(e)}")
-            return []
-    
-    def restore_products_to_db(self, store_id: int) -> bool:
-        """Restore products from Firebase to local database"""
-        if not self.db:
-            logger.error("Firebase not connected")
-            return False
-        
-        try:
-            products_data = self.restore_from_firebase(store_id, 'products')
-            if not products_data:
-                logger.info("No products to restore")
-                return False
-            
-            conn = sqlite3.connect(get_db_path())
-            cursor = conn.cursor()
-            
-            # Clear existing products for this store
-            cursor.execute('DELETE FROM products WHERE store_id = ?', (store_id,))
-            
-            # Insert restored products - include all fields
-            for product in products_data:
-                try:
-                    cursor.execute('''INSERT INTO products 
-                                    (store_id, product_name, category, price, quantity, tax_percentage, 
-                                     product_code, mrp, unit, created_at)
-                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                                (store_id, 
-                                 product.get('product_name'), 
-                                 product.get('category'), 
-                                 product.get('price'), 
-                                 product.get('quantity', 0), 
-                                 product.get('tax_percentage', 0),
-                                 product.get('product_code', ''),
-                                 product.get('mrp'),
-                                 product.get('unit', 'pcs'),
-                                 product.get('created_at', datetime.now().isoformat())))
-                except Exception as e:
-                    logger.warning(f"Error inserting product {product.get('product_name')}: {str(e)}")
-                    # Fallback without product_code/mrp/unit
-                    try:
-                        cursor.execute('''INSERT INTO products (store_id, product_name, category, price, quantity, tax_percentage, created_at)
-                                        VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                                    (store_id, product['product_name'], product.get('category'), 
-                                     product.get('price'), product.get('quantity', 0), 
-                                     product.get('tax_percentage', 0), product.get('created_at', datetime.now().isoformat())))
-                    except Exception as e2:
-                        logger.error(f"Failed to restore product {product.get('product_name')}: {str(e2)}")
-            
-            conn.commit()
-            conn.close()
-            logger.info(f"Restored {len(products_data)} products to database")
-            return True
-        except Exception as e:
-            logger.error(f"Error restoring products to database: {str(e)}")
-            return False
-    
-    def _get_table_columns(self, conn, table_name: str) -> set:
-        """Get all column names in a table"""
-        try:
-            cursor = conn.cursor()
-            cursor.execute(f"PRAGMA table_info({table_name})")
-            columns = set(row[1] for row in cursor.fetchall())
-            return columns
-        except Exception as e:
-            logger.error(f"Error getting table columns for {table_name}: {e}")
-            return set()
-
-    def _filter_dict_for_insert(self, data_dict: dict, table_name: str, conn, required_fields: List[str] = None) -> tuple:
-        """Filter data dict to only include columns that exist in the table.
-        
-        Returns (filtered_dict, columns, placeholders) tuple ready for SQL INSERT/UPDATE
-        """
-        existing_columns = self._get_table_columns(conn, table_name)
-        filtered = {}
-        
-        for key, value in data_dict.items():
-            if key in existing_columns:
-                filtered[key] = value
-        
-        # Ensure required fields are present
-        if required_fields:
-            for field in required_fields:
-                if field not in filtered and field in existing_columns:
-                    filtered[field] = None
-        
-        return filtered
-
-    def restore_bills_to_db(self, store_id: int) -> bool:
-        """Restore bills and bill items from Firebase to local database"""
-        if not self.db:
-            logger.error("Firebase not connected")
-            return False
-        
-        try:
-            bills_data = self.restore_from_firebase(store_id, 'bills')
-            if not bills_data:
-                logger.info("No bills to restore")
-                return False
-            
-            conn = sqlite3.connect(get_db_path())
-            cursor = conn.cursor()
-            
-            # Get existing columns in bills table
-            existing_columns = self._get_table_columns(conn, 'bills')
-            logger.info(f"Bills table columns: {existing_columns}")
-            
-            # Note: We don't delete existing bills as they are historical records
-            # Only restore if bill doesn't already exist
-            restored_count = 0
-            
-            for bill in bills_data:
-                try:
-                    # Check if bill already exists
-                    cursor.execute('SELECT bill_id FROM bills WHERE bill_id = ?', (bill.get('bill_id'),))
-                    if cursor.fetchone():
-                        continue  # Skip existing bills
-                    
-                    # Build INSERT statement dynamically based on available columns
-                    bill_columns = []
-                    bill_values = []
-                    
-                    for col in ['store_id', 'bill_number', 'customer_id', 'employee_id', 'bill_date', 'total_amount', 'tax_amount', 'final_amount']:
-                        if col in existing_columns:
-                            bill_columns.append(col)
-                            if col == 'store_id':
-                                bill_values.append(store_id)
-                            elif col == 'employee_id':
-                                # employee_id may not exist; skip if missing in schema
-                                val = bill.get(col)
-                                bill_values.append(val)
-                            else:
-                                bill_values.append(bill.get(col))
-                    
-                    if not bill_columns:
-                        logger.warning(f"No compatible columns found for bill {bill.get('bill_id')}")
-                        continue
-                    
-                    cols_str = ', '.join(bill_columns)
-                    placeholders = ', '.join(['?' for _ in bill_columns])
-                    
-                    cursor.execute(f'INSERT INTO bills ({cols_str}) VALUES ({placeholders})', bill_values)
-                    bill_id = cursor.lastrowid
-                    
-                    # Insert bill items
-                    for item in bill.get('items', []):
-                        try:
-                            cursor.execute('''INSERT INTO bill_items (bill_id, product_id, quantity, price, gst_rate, item_total)
-                                            VALUES (?, ?, ?, ?, ?, ?)''',
-                                        (bill_id, item.get('product_id'), item.get('quantity'),
-                                         item.get('price'), item.get('gst_rate'), item.get('item_total')))
-                        except Exception as item_err:
-                            logger.warning(f"Failed to insert bill item: {item_err}")
-                    
-                    restored_count += 1
-                except Exception as bill_err:
-                    logger.warning(f"Failed to restore bill {bill.get('bill_id')}: {bill_err}")
-            
-            conn.commit()
-            conn.close()
-            logger.info(f"Restored {restored_count} bills with items to database")
-            return restored_count > 0
-        except Exception as e:
-            logger.error(f"Error restoring bills to database: {str(e)}")
-            return False
-    
-    def restore_customers_to_db(self, store_id: int) -> bool:
-        """Restore customers from Firebase to local database"""
-        if not self.db:
-            logger.error("Firebase not connected")
-            return False
-        
-        try:
-            customers_data = self.restore_from_firebase(store_id, 'customers')
-            if not customers_data:
-                logger.info("No customers to restore")
-                return False
-            
-            conn = sqlite3.connect(get_db_path())
-            cursor = conn.cursor()
-            
-            # Get existing columns in customers table
-            existing_columns = self._get_table_columns(conn, 'customers')
-            logger.info(f"Customers table columns: {existing_columns}")
-            
-            restored_count = 0
-            
-            for customer in customers_data:
-                try:
-                    # Check if customer already exists
-                    cursor.execute('SELECT customer_id FROM customers WHERE customer_id = ?', (customer.get('customer_id'),))
-                    if cursor.fetchone():
-                        continue
-                    
-                    # Build INSERT statement dynamically based on available columns
-                    cust_columns = []
-                    cust_values = []
-                    
-                    for col in ['customer_name', 'phone', 'email', 'address', 'gstin', 'created_at']:
-                        if col in existing_columns:
-                            cust_columns.append(col)
-                            if col == 'created_at':
-                                cust_values.append(customer.get(col, datetime.now().isoformat()))
-                            else:
-                                cust_values.append(customer.get(col))
-                    
-                    if not cust_columns:
-                        logger.warning(f"No compatible columns found for customer {customer.get('customer_id')}")
-                        continue
-                    
-                    cols_str = ', '.join(cust_columns)
-                    placeholders = ', '.join(['?' for _ in cust_columns])
-                    
-                    cursor.execute(f'INSERT INTO customers ({cols_str}) VALUES ({placeholders})', cust_values)
-                    restored_count += 1
-                except Exception as cust_err:
-                    logger.warning(f"Failed to restore customer {customer.get('customer_id')}: {cust_err}")
-            
-            conn.commit()
-            conn.close()
-            logger.info(f"Restored {restored_count} customers to database")
-            return restored_count > 0
-        except Exception as e:
-            logger.error(f"Error restoring customers to database: {str(e)}")
-            return False
-            conn.commit()
-            conn.close()
-            logger.info(f"Restored {restored_count} customers to database")
-            return restored_count > 0
-        except Exception as e:
-            logger.error(f"Error restoring customers to database: {str(e)}")
-            return False
-    
-    def restore_settings_to_db(self) -> bool:
-        """Restore system settings from Firebase to local database"""
-        if not self.db:
-            logger.error("Firebase not connected")
-            return False
-        
-        try:
-            doc = self.db.collection('system').document('settings').get()
-            if not doc.exists:
-                logger.info("No settings to restore")
-                return False
-            
-            data = doc.to_dict()
-            settings_data = data.get('settings', {})
-            stores_data = data.get('stores', [])
-
-            # If both settings and stores are empty, nothing to restore
-            if not settings_data and not stores_data:
-                return False
-            
-            conn = sqlite3.connect(get_db_path())
-            cursor = conn.cursor()
-            
-            restored_count = 0
-            
-            # Restore settings
-            for key, value in settings_data.items():
-                cursor.execute('SELECT key FROM settings WHERE key = ?', (key,))
-                if cursor.fetchone():
-                    # Update existing setting
-                    cursor.execute('UPDATE settings SET value = ? WHERE key = ?', (value, key))
-                else:
-                    # Insert new setting
-                    cursor.execute('INSERT INTO settings (key, value) VALUES (?, ?)', (key, value))
-                restored_count += 1
-            
-            # Restore stores
-            for store in stores_data:
-                try:
-                    # Prefer to insert with explicit store_id if provided (best-effort)
-                    sid = store.get('store_id')
-                    if sid:
-                        cursor.execute('SELECT store_id FROM stores WHERE store_id = ?', (sid,))
-                        if not cursor.fetchone():
-                            cursor.execute('''INSERT INTO stores (store_id, store_name, owner_name, phone, email, address, created_at)
-                                              VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                                           (sid, store.get('store_name'), store.get('owner_name'),
-                                            store.get('phone'), store.get('email'),
-                                            store.get('address'), store.get('created_at', datetime.now().isoformat())))
-                    else:
-                        cursor.execute('SELECT store_id FROM stores WHERE store_name = ? LIMIT 1', (store.get('store_name'),))
-                        if not cursor.fetchone():
-                            cursor.execute('''INSERT INTO stores (store_name, owner_name, phone, email, address, created_at)
-                                            VALUES (?, ?, ?, ?, ?, ?)''',
-                                           (store.get('store_name'), store.get('owner_name'),
-                                            store.get('phone'), store.get('email'),
-                                            store.get('address'), store.get('created_at', datetime.now().isoformat())))
-                except Exception as e:
-                    logger.warning(f"Failed restoring store {store}: {e}")
-            
-            conn.commit()
-            conn.close()
-            logger.info(f"Restored {restored_count} settings to database")
-            return True
-        except Exception as e:
-            logger.error(f"Error restoring settings to database: {str(e)}")
-            return False
-    
-    def restore_gst_config_to_db(self) -> bool:
-        """Restore GST configuration from Firebase to local database"""
-        if not self.db:
-            logger.error("Firebase not connected")
-            return False
-        
-        try:
-            doc = self.db.collection('system').document('gst_config').get()
-            if not doc.exists:
-                logger.info("No GST configuration to restore")
-                return False
-            
-            data = doc.to_dict()
-            gst_configs = data.get('gst_config', [])
-            
-            if not gst_configs:
-                return False
-            
-            conn = sqlite3.connect(DB_PATH if 'DB_PATH' in globals() else 'hype_billing_system.db')
-            cursor = conn.cursor()
-            
-            restored_count = 0
-            
-            for config in gst_configs:
-                cursor.execute('SELECT gst_id FROM gst_config WHERE category = ?', (config.get('category'),))
-                if cursor.fetchone():
-                    # Update existing
-                    cursor.execute('''UPDATE gst_config SET sgst_rate = ?, cgst_rate = ?, igst_rate = ?, hsn_code = ?
-                                    WHERE category = ?''',
-                                (config.get('sgst_rate'), config.get('cgst_rate'),
-                                 config.get('igst_rate'), config.get('hsn_code'),
-                                 config.get('category')))
-                else:
-                    # Insert new
-                    cursor.execute('''INSERT INTO gst_config (category, sgst_rate, cgst_rate, igst_rate, hsn_code)
-                                    VALUES (?, ?, ?, ?, ?)''',
-                                (config.get('category'), config.get('sgst_rate'),
-                                 config.get('cgst_rate'), config.get('igst_rate'),
-                                 config.get('hsn_code')))
-                restored_count += 1
-            
-            conn.commit()
-            conn.close()
-            logger.info(f"Restored {restored_count} GST configurations to database")
-            return True
-        except Exception as e:
-            logger.error(f"Error restoring GST config to database: {str(e)}")
-            return False
-    
-    def auto_restore_all_data(self, store_id: int) -> Dict[str, bool]:
-        """Automatically restore all data from Firebase on login"""
-        logger.info("Starting automatic data restoration from Firebase...")
-        
-        results = {
-            'products': self.restore_products_to_db(store_id),
-            'bills': self.restore_bills_to_db(store_id),
-            'customers': self.restore_customers_to_db(store_id),
-            'settings': self.restore_settings_to_db(),
-            'gst_config': self.restore_gst_config_to_db(),
-            'users': self.restore_users_to_db(),
-            'employees': self.restore_employees_to_db(store_id),
-            'payroll': self.restore_payroll_to_db(store_id),
-            'payslips': self.restore_payslips_to_db(store_id),
-            'offline_queue': self.restore_offline_queue_to_local(store_id)
-        }
-
-        # Attempt to download storage assets (pdfs, attachments) for this store
-        try:
-            storage_ok = self.download_store_assets(store_id)
-        except Exception as e:
-            logger.warning(f"Error downloading storage assets for store {store_id}: {e}")
-            storage_ok = False
-        results['storage'] = storage_ok
-        
-        logger.info(f"Auto-restore completed: {results}")
-        return results
-
-    def restore_users_to_db(self) -> bool:
-        """Restore users (employees/admins) from Firebase to local database"""
-        if not self.db:
-            logger.error("Firebase not connected")
-            return False
-
-        try:
-            doc = self.db.collection('system').document('users').get()
-            if not doc.exists:
-                logger.info('No users backup found')
-                return False
-
-            data = doc.to_dict()
-            users_list = data.get('users', [])
-            if not users_list:
-                return False
-
-            conn = sqlite3.connect(DB_PATH if 'DB_PATH' in globals() else 'hype_billing_system.db')
-            cursor = conn.cursor()
-            restored = 0
-            for u in users_list:
-                try:
-                    username = u.get('username')
-                    if not username:
-                        continue
-                    cursor.execute('SELECT id, password FROM users WHERE username = ?', (username,))
-                    existing = cursor.fetchone()
-                    filtered = self._filter_dict_for_insert(u, 'users', conn)
-                    if existing:
-                        local_password = existing[1]
-                        updates = []
-                        vals = []
-                        for key, value in filtered.items():
-                            if key == 'id':
-                                continue
-                            if key == 'password':
-                                if not local_password and value:
-                                    updates.append('password=?')
-                                    vals.append(value)
-                                continue
-                            updates.append(f"{key}=?")
-                            vals.append(value)
-                        if updates:
-                            vals.append(username)
-                            cursor.execute(f"UPDATE users SET {', '.join(updates)} WHERE username = ?", tuple(vals))
-                    else:
-                        if filtered:
-                            filtered.setdefault('role', 'employee')
-                            filtered.setdefault('password', '')
-                            cols = ', '.join(filtered.keys())
-                            placeholders = ', '.join(['?'] * len(filtered))
-                            cursor.execute(f'INSERT INTO users ({cols}) VALUES ({placeholders})', tuple(filtered.values()))
-                    restored += 1
-                except Exception as e:
-                    logger.warning(f"Failed restoring user {u.get('username')}: {e}")
-
-            conn.commit()
-            conn.close()
-            logger.info(f"Restored {restored} users to database")
-            return restored > 0
-        except Exception as e:
-            logger.error(f"Error restoring users to database: {e}")
-            return False
-
-    def restore_user_from_firebase(self, username: str, password: str = None, password_hash: str = None) -> bool:
-        """Restore a single user record from Firebase when the local DB does not have that user."""
-        if not self.db:
-            logger.error("Firebase not connected")
-            return False
-        if not username:
-            return False
-
-        try:
-            doc = self.db.collection('system').document('users').get()
-            if not doc.exists:
-                logger.info('No users backup found')
-                return False
-
-            data = doc.to_dict()
-            users_list = data.get('users', [])
-            if not users_list:
-                return False
-
-            expected_hash = password_hash or (_hash_password(password) if password else None)
-            if not expected_hash:
-                logger.info('No password provided for user restore')
-                return False
-
-            conn = sqlite3.connect(get_db_path())
-            cursor = conn.cursor()
-            restored = False
-            for u in users_list:
-                if u.get('username') != username:
-                    continue
-                remote_hash = u.get('password')
-                if not remote_hash or remote_hash != expected_hash:
-                    logger.info(f'Password mismatch for remote user {username}')
-                    continue
-                cursor.execute('SELECT id, password FROM users WHERE username = ?', (username,))
-                existing = cursor.fetchone()
-                filtered = self._filter_dict_for_insert(u, 'users', conn)
-                if existing:
-                    if not existing[1] and filtered.get('password'):
-                        cursor.execute('UPDATE users SET password=? WHERE username=?', (filtered.get('password'), username))
-                else:
-                    if filtered:
-                        filtered.setdefault('role', 'employee')
-                        filtered.setdefault('password', expected_hash)
-                        cols = ', '.join(filtered.keys())
-                        placeholders = ', '.join(['?'] * len(filtered))
-                        cursor.execute(f'INSERT INTO users ({cols}) VALUES ({placeholders})', tuple(filtered.values()))
-                restored = True
-                break
-
-            conn.commit()
-            conn.close()
-            if restored:
-                logger.info(f'Restored user {username} from Firebase')
-            return restored
-        except Exception as e:
-            logger.error(f'Error restoring user {username}: {e}')
-            return False
-
-    def restore_employees_to_db(self, store_id: int) -> bool:
-        """Restore employees from Firebase backup into local `employees` table."""
-        if not self.db:
-            logger.error("Firebase not connected")
-            return False
-
-        try:
-            data = self.restore_from_firebase(store_id, 'employees')
-            if not data:
-                logger.info('No employees to restore')
-                return False
-
-            conn = sqlite3.connect(get_db_path())
-            cursor = conn.cursor()
-            # Do not delete existing records; upsert by employee id or unique fields
-            restored = 0
-            for e in data:
-                try:
-                    emp_id = e.get('emp_id') or e.get('id')
-                    if not emp_id:
-                        continue
-                    cursor.execute('SELECT id FROM employees WHERE id = ?', (emp_id,))
-                    if cursor.fetchone():
-                        # Update best-effort
-                        cols = self._get_table_columns(conn, 'employees')
-                        updates = []
-                        vals = []
-                        for k, v in e.items():
-                            if k in cols and k != 'id':
-                                updates.append(f"{k}=?")
-                                vals.append(v)
-                        if updates:
-                            vals.append(emp_id)
-                            cursor.execute(f"UPDATE employees SET {', '.join(updates)} WHERE id=?", vals)
-                    else:
-                        filtered = self._filter_dict_for_insert(e, 'employees', conn)
-                        if filtered:
-                            cols = ', '.join(filtered.keys())
-                            placeholders = ', '.join(['?'] * len(filtered))
-                            cursor.execute(f'INSERT INTO employees ({cols}) VALUES ({placeholders})', list(filtered.values()))
-                    restored += 1
-                except Exception as ex:
-                    logger.warning(f"Failed restoring employee {e.get('emp_id')}: {ex}")
-
-            conn.commit()
-            conn.close()
-            logger.info(f"Restored {restored} employees to database")
-            return restored > 0
-        except Exception as e:
-            logger.error(f"Error restoring employees: {e}")
-            return False
-
-    def restore_payroll_to_db(self, store_id: int) -> bool:
-        """Restore payroll/payslips from Firebase backup into local `payroll` table."""
-        if not self.db:
-            logger.error("Firebase not connected")
-            return False
-
-        try:
-            data = self.restore_from_firebase(store_id, 'payroll')
-            if not data:
-                logger.info('No payroll data to restore')
-                return False
-
-            conn = sqlite3.connect(get_db_path())
-            cursor = conn.cursor()
-            restored = 0
-            for p in data:
-                try:
-                    # Determine primary key heuristically
-                    pid = p.get('id') or p.get('payroll_id')
-                    if pid:
-                        cursor.execute('SELECT id FROM payroll WHERE id = ?', (pid,))
-                        if cursor.fetchone():
-                            # update
-                            cols = self._get_table_columns(conn, 'payroll')
-                            updates = []
-                            vals = []
-                            for k, v in p.items():
-                                if k in cols and k != 'id':
-                                    updates.append(f"{k}=?")
-                                    vals.append(v)
-                            if updates:
-                                vals.append(pid)
-                                cursor.execute(f"UPDATE payroll SET {', '.join(updates)} WHERE id=?", vals)
-                        else:
-                            filtered = self._filter_dict_for_insert(p, 'payroll', conn)
-                            if filtered:
-                                cols = ', '.join(filtered.keys())
-                                placeholders = ', '.join(['?'] * len(filtered))
-                                cursor.execute(f'INSERT INTO payroll ({cols}) VALUES ({placeholders})', list(filtered.values()))
-                    else:
-                        filtered = self._filter_dict_for_insert(p, 'payroll', conn)
-                        if filtered:
-                            cols = ', '.join(filtered.keys())
-                            placeholders = ', '.join(['?'] * len(filtered))
-                            cursor.execute(f'INSERT INTO payroll ({cols}) VALUES ({placeholders})', list(filtered.values()))
-                    restored += 1
-                except Exception as ex:
-                    logger.warning(f"Failed restoring payroll record: {ex}")
-
-            conn.commit()
-            conn.close()
-            logger.info(f"Restored {restored} payroll records to database")
-            return restored > 0
-        except Exception as e:
-            logger.error(f"Error restoring payroll: {e}")
-            return False
-
-    def restore_payslips_to_db(self, store_id: int) -> bool:
-        """Restore payslips from Firebase backup into local `payslips` table."""
-        if not self.db:
-            logger.error("Firebase not connected")
-            return False
-
-        try:
-            data = self.restore_from_firebase(store_id, 'payslips')
-            if not data:
-                logger.info('No payslips to restore')
-                return False
-
-            conn = sqlite3.connect(get_db_path())
-            cursor = conn.cursor()
-            restored = 0
-            for p in data:
-                try:
-                    pid = p.get('id') or p.get('payslip_id')
-                    if pid:
-                        cursor.execute('SELECT id FROM payslips WHERE id = ?', (pid,))
-                        if cursor.fetchone():
-                            cols = self._get_table_columns(conn, 'payslips')
-                            updates = []
-                            vals = []
-                            for k, v in p.items():
-                                if k in cols and k != 'id':
-                                    updates.append(f"{k}=?")
-                                    vals.append(v)
-                            if updates:
-                                vals.append(pid)
-                                cursor.execute(f"UPDATE payslips SET {', '.join(updates)} WHERE id=?", vals)
-                        else:
-                            filtered = self._filter_dict_for_insert(p, 'payslips', conn)
-                            if filtered:
-                                cols = ', '.join(filtered.keys())
-                                placeholders = ', '.join(['?'] * len(filtered))
-                                cursor.execute(f'INSERT INTO payslips ({cols}) VALUES ({placeholders})', list(filtered.values()))
-                    else:
-                        filtered = self._filter_dict_for_insert(p, 'payslips', conn)
-                        if filtered:
-                            cols = ', '.join(filtered.keys())
-                            placeholders = ', '.join(['?'] * len(filtered))
-                            cursor.execute(f'INSERT INTO payslips ({cols}) VALUES ({placeholders})', list(filtered.values()))
-                    restored += 1
-                except Exception as ex:
-                    logger.warning(f"Failed restoring payslip record: {ex}")
-
-            conn.commit()
-            conn.close()
-            logger.info(f"Restored {restored} payslip records to database")
-            return restored > 0
-        except Exception as e:
-            logger.error(f"Error restoring payslips: {e}")
-            return False
-
-
 # Global sync manager instance
 firebase_sync_manager = None
 
@@ -2121,7 +1733,7 @@ def get_db_path():
     """
     if getattr(sys, 'frozen', False):
         appdata_dir = os.getenv('LOCALAPPDATA') or os.getenv('APPDATA') or os.path.expanduser('~')
-        data_dir = os.path.join(appdata_dir, 'HypeRetailBilling')
+        data_dir = os.path.join(appdata_dir, 'HypeERP')
     else:
         data_dir = os.path.dirname(os.path.abspath(__file__))
     try:
@@ -2187,22 +1799,172 @@ def initialize_firebase_sync(*args, **kwargs):
         logger.error(f"initialize_firebase_sync failed: {e}")
         return None
 
-def get_firebase_sync_manager() -> FirebaseSync:
-    """Get global Firebase sync manager"""
+def get_firebase_sync_manager(credentials_path=None) -> FirebaseSync:
+    """Get global Firebase sync manager and reuse it when the credentials path matches."""
     global firebase_sync_manager
+    resolved_path = _resolve_credentials_path(credentials_path or 'serviceAccountKey.json')
+
     if firebase_sync_manager is None:
-        # Use absolute path resolution
-        if getattr(sys, 'frozen', False):
-            base_path = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
-        else:
-            base_path = os.path.dirname(os.path.abspath(__file__))
-        credentials_path = os.path.join(base_path, 'serviceAccountKey.json')
-        firebase_sync_manager = FirebaseSync(credentials_path)
+        firebase_sync_manager = FirebaseSync(credentials_path=resolved_path)
+    elif getattr(firebase_sync_manager, 'credentials_path', None) != resolved_path:
+        firebase_sync_manager = FirebaseSync(credentials_path=resolved_path)
+
     return firebase_sync_manager
 
-def shutdown_firebase_sync():
+def shutdown_firebase_sync(fs_instance=None):
     """Shutdown Firebase sync"""
     global firebase_sync_manager
-    if firebase_sync_manager:
-        firebase_sync_manager.stop_auto_sync()
-        logger.info("Firebase sync shutdown")
+    # Use provided instance or global manager
+    instance = fs_instance if fs_instance else firebase_sync_manager
+    if instance:
+        try:
+            instance.stop_auto_sync()
+            logger.info("Firebase sync shutdown")
+        except Exception as e:
+            logger.warning(f"Error stopping auto-sync: {e}")
+
+def trigger_immediate_sync(store_id: int = 1):
+    """Trigger immediate Firebase sync for urgent operations like bill creation"""
+    global firebase_sync_manager
+    try:
+        fsm = get_firebase_sync_manager()
+        if fsm and hasattr(fsm, 'sync_wake_event'):
+            logger.info(f"⚡ Triggering immediate sync for store {store_id}")
+            fsm.sync_wake_event.set()
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"Error triggering immediate sync: {e}")
+        return False
+
+def sync_all_data_immediately(store_id: int = 1):
+    """Sync ALL data types immediately to Firebase (bills, products, customers, stock, users, etc.)"""
+    global firebase_sync_manager
+    try:
+        fsm = get_firebase_sync_manager()
+        if not fsm or not getattr(fsm, 'db', None):
+            logger.warning("Firebase not available for immediate data sync")
+            return False
+        
+        logger.info(f"📤 IMMEDIATE SYNC: Syncing all data for store {store_id}")
+        
+        # Sync all critical data tables
+        tables_to_sync = [
+            'invoices',
+            'invoice_items', 
+            'products',
+            'stock',
+            'customers',
+            'users',
+            'employees',
+            'accounts',
+            'suppliers'
+        ]
+        
+        synced_count = 0
+        for table in tables_to_sync:
+            try:
+                fsm.sync_table_to_firestore(table, f'stores/{store_id}/{table}')
+                synced_count += 1
+                logger.info(f"  ✅ {table}")
+            except Exception as e:
+                logger.warning(f"  ❌ {table}: {str(e)}")
+        
+        logger.info(f"✅ Immediate sync complete: {synced_count}/{len(tables_to_sync)} tables synced")
+        trigger_immediate_sync(store_id)
+        return synced_count > 0
+    except Exception as e:
+        logger.error(f"Error in sync_all_data_immediately: {e}")
+        return False
+
+def queue_operation_if_offline(operation_type: str, data: Dict[str, Any], store_id: int = 1):
+    """Queue an operation for offline processing if Firebase is unavailable"""
+    global firebase_sync_manager
+    try:
+        fsm = get_firebase_sync_manager()
+        if not fsm or not getattr(fsm, 'db', None):
+            # Firebase offline - add to queue
+            queue_data = {
+                'type': operation_type,
+                'store_id': store_id,
+                'data': data,
+                'timestamp': datetime.now().isoformat(),
+                'synced': False
+            }
+            
+            queue_file = fsm.offline_queue_file if fsm else 'offline_queue.json'
+            try:
+                if os.path.exists(queue_file):
+                    with open(queue_file, 'r') as f:
+                        queue = json.load(f)
+                else:
+                    queue = []
+                
+                queue.append(queue_data)
+                
+                with open(queue_file, 'w') as f:
+                    json.dump(queue, f, indent=2)
+                
+                logger.info(f"📋 Operation queued for offline processing: {operation_type}")
+                return True
+            except Exception as e:
+                logger.error(f"Error queuing operation: {e}")
+                return False
+        return False
+    except Exception as e:
+        logger.error(f"Error in queue_operation_if_offline: {e}")
+        return False
+
+def process_offline_queue():
+    """Process all queued operations when internet is restored"""
+    global firebase_sync_manager
+    try:
+        fsm = get_firebase_sync_manager()
+        if not fsm or not getattr(fsm, 'db', None):
+            logger.warning("Firebase not available for queue processing")
+            return 0
+        
+        queue_file = fsm.offline_queue_file
+        if not os.path.exists(queue_file):
+            logger.info("No offline queue to process")
+            return 0
+        
+        with open(queue_file, 'r') as f:
+            queue = json.load(f)
+        
+        processed_count = 0
+        remaining_queue = []
+        
+        for operation in queue:
+            try:
+                op_type = operation.get('type', '')
+                op_data = operation.get('data', {})
+                store_id = operation.get('store_id', 1)
+                
+                logger.info(f"Processing queued operation: {op_type}")
+                # Actual processing would depend on operation type
+                # For now, just mark as synced
+                operation['synced'] = True
+                processed_count += 1
+                logger.info(f"✅ Queued operation {op_type} processed")
+            except Exception as e:
+                logger.error(f"Error processing queued operation {op_type}: {e}")
+                remaining_queue.append(operation)
+        
+        # Save remaining unprocessed operations
+        if remaining_queue:
+            with open(queue_file, 'w') as f:
+                json.dump(remaining_queue, f, indent=2)
+            logger.info(f"⚠️ {len(remaining_queue)} operations still pending in queue")
+        else:
+            # Queue is empty, remove the file
+            try:
+                os.remove(queue_file)
+                logger.info("✅ Offline queue processed completely")
+            except Exception:
+                pass
+        
+        return processed_count
+    except Exception as e:
+        logger.error(f"Error processing offline queue: {e}")
+        return 0

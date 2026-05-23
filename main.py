@@ -6,6 +6,7 @@
 
 from tkinter import *
 from tkinter import messagebox, ttk, filedialog
+import logging
 import threading
 import os
 import tempfile
@@ -16,7 +17,17 @@ import json
 import webbrowser
 import time
 import hashlib
+import multiprocessing
 from modules.window_utils import set_icon, get_runtime_path
+
+# Windows single-instance lock (prevents multiple app instances)
+try:
+    import win32event
+    import win32api
+    import winerror
+    HAS_WIN32 = True
+except ImportError:
+    HAS_WIN32 = False
 
 # ── Branding ───────────────────────────────────────────────────────────────────
 HYPE_ERP_NAME    = 'Hype ERP'
@@ -57,6 +68,13 @@ except ImportError:
     TallyWindow = None
 
 try:
+    from modules.hsn_config import HSNConfigModule
+    HAS_HSN_CONFIG = True
+except ImportError:
+    HAS_HSN_CONFIG = False
+    HSNConfigModule = None
+
+try:
     from ai_assistant import AIAssistantWindow, predict_sales, is_model_installed, smart_product_search
     HAS_AI = True
 except ImportError:
@@ -76,12 +94,13 @@ except ImportError:
     def load_firebase_config(): return {}
 
 try:
-    from firebase_sync import initialize_firebase_sync, shutdown_firebase_sync
+    from firebase_sync import initialize_firebase_sync, shutdown_firebase_sync, get_firebase_sync_manager
     FIREBASE_AVAILABLE = True
 except ImportError:
     FIREBASE_AVAILABLE = False
     def initialize_firebase_sync(*a, **k): return None
     def shutdown_firebase_sync(*a, **k): pass
+    def get_firebase_sync_manager(): return None
 
 try:
     from auto_install import run_auto_install
@@ -106,10 +125,64 @@ except ImportError:
     BillingWindow = None
 
 # ── State ─────────────────────────────────────────────────────────────────────
-CURRENT_USER  = None
-CURRENT_ROLE  = None
-FIREBASE_SYNC = None
-root          = None
+CURRENT_USER    = None
+CURRENT_ROLE    = None
+FIREBASE_SYNC   = None
+root            = None
+LOGIN_WINDOW    = None
+APP_STARTED     = False
+LOGIN_IN_PROGRESS = False
+LOGIN_WINDOW_LOCK = threading.Lock()
+WINDOW_CREATION_LOCK = threading.RLock()  # Recursive lock for window creation
+APP_INSTANCE_LOCK = None  # Windows mutex for single instance
+
+# ── Logging Setup ─────────────────────────────────────────────────────────────
+def setup_logging():
+    """Setup comprehensive logging to both console and file for EXE debugging."""
+    log_dir = None
+    
+    # For frozen EXE, use LOCALAPPDATA
+    if getattr(sys, 'frozen', False):
+        log_dir = os.path.join(
+            os.getenv('LOCALAPPDATA') or os.getenv('APPDATA') or os.path.expanduser('~'),
+            'HypeERP'
+        )
+    else:
+        log_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, 'hype_erp.log')
+    
+    # Create logger
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.DEBUG)
+    
+    # File handler
+    try:
+        fh = logging.FileHandler(log_file, encoding='utf-8')
+        fh.setLevel(logging.DEBUG)
+    except Exception:
+        fh = None
+    
+    # Console handler
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    
+    # Formatter
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    if fh:
+        fh.setFormatter(formatter)
+        logger.addHandler(fh)
+    ch.setFormatter(formatter)
+    logger.addHandler(ch)
+    
+    return logger
+
+logger = setup_logging()
 
 # ── GST Rates ────────────────────────────────────────────────────────────────
 GST_RATES = {
@@ -165,8 +238,20 @@ def _migrate_passwords(conn):
     except Exception:
         pass
 
+def _migrate_products(conn):
+    """✅ Add category_code column to products table if it doesn't exist"""
+    try:
+        c = conn.cursor()
+        c.execute("PRAGMA table_info(products)")
+        cols = [row[1] for row in c.fetchall()]
+        if 'category_code' not in cols:
+            conn.execute('ALTER TABLE products ADD COLUMN category_code TEXT')
+            conn.commit()
+    except Exception:
+        pass
+
 # ── Firebase key ─────────────────────────────────────────────────────────────────
-FIREBASE_SECRET_KEY = b'0VwvF8woSw8sCS_46Xd6HWUDCfuqJsXQTlfyy8krORE='
+FIREBASE_SECRET_KEY = b'J6TmP2PtNyXGZX28P8b2_CO2xRJ2c-xk2AIIJtu1gPc='
 
 def _firebase_configured():
     """True only when a real serviceAccountKey file exists."""
@@ -202,6 +287,35 @@ else:
 os.makedirs(_app_dir, exist_ok=True)
 DB_PATH = os.path.join(_app_dir, 'hype_billing_system.db')
 
+# Log startup info now that variables are defined
+logger.info(f'=== {HYPE_ERP_NAME} {HYPE_ERP_VERSION} Started ===')
+logger.info(f'Running from: {os.path.abspath(__file__)}')
+logger.info(f'Database path: {DB_PATH}')
+logger.info(f'Python version: {sys.version}')
+logger.info(f'Platform: {sys.platform}')
+logger.info(f'Frozen: {getattr(sys, "frozen", False)}')
+
+
+def _get_login_firebase_credentials_path():
+    try:
+        temp_path = load_firebase_key_temp()
+        if temp_path and os.path.exists(temp_path):
+            return temp_path
+    except Exception as exc:
+        logger.warning(f'Unable to load temp Firebase credentials: {exc}')
+
+    runtime_path = get_runtime_path('serviceAccountKey.json')
+    if os.path.exists(runtime_path):
+        return runtime_path
+
+    enc_path = get_runtime_path('serviceAccountKey.enc')
+    if os.path.exists(enc_path):
+        return enc_path
+
+    logger.warning('No Firebase credentials found for login flow')
+    return None
+
+
 # ── Database init ────────────────────────────────────────────────────────────────
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -219,7 +333,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL, barcode TEXT UNIQUE,
-            category TEXT, unit TEXT DEFAULT 'pcs',
+            category TEXT, category_code TEXT, unit TEXT DEFAULT 'pcs',
             purchase_price REAL DEFAULT 0.0, selling_price REAL DEFAULT 0.0,
             stock INTEGER DEFAULT 0, min_stock INTEGER DEFAULT 10,
             gst_rate REAL DEFAULT 18.0, hsn_code TEXT, last_sold TEXT,
@@ -255,8 +369,18 @@ def init_db():
             gstin TEXT, owner_name TEXT, state_code TEXT DEFAULT '29',
             logo_path TEXT, is_active INTEGER DEFAULT 1
         );
+        CREATE TABLE IF NOT EXISTS category_hsn_mapping (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category TEXT UNIQUE NOT NULL,
+            hsn_code TEXT NOT NULL,
+            description TEXT,
+            gst_rate REAL DEFAULT 18.0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
     """)
     _migrate_passwords(conn)
+    _migrate_products(conn)
     c.execute('SELECT COUNT(*) FROM users')
     if c.fetchone()[0] == 0:
         c.execute('INSERT INTO users (username,password,role,full_name) VALUES (?,?,?,?)',
@@ -265,6 +389,31 @@ def init_db():
     conn.close()
     try: init_tally_tables()
     except Exception: pass
+    try: _init_default_hsn_codes()
+    except Exception as e:
+        print(f"Note: Could not initialize HSN codes: {e}")
+
+def _init_default_hsn_codes():
+    """Initialize default HSN codes for standard categories"""
+    DEFAULT_HSN = {
+        'Cosmetics': '3304', 'Grocery': '0901', 'Drinks': '2202',
+        'Electronics': '8471', 'Clothing': '6201', 'Food & Beverage': '1905',
+        'Dairy': '0401', 'Pharmaceuticals': '3004', 'Automotive': '8704',
+        'Furniture': '9403', 'Books': '4901', 'Education Services': '9209',
+        'Healthcare': '6211', 'Agriculture': '1001', 'Construction': '6810',
+        'Metals': '7208', 'Chemicals': '2817', 'Tobacco': '2402',
+        'Services': '9999', 'Petroleum Products': '2710',
+    }
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        for cat, hsn in DEFAULT_HSN.items():
+            c.execute("INSERT OR IGNORE INTO category_hsn_mapping (category, hsn_code) VALUES (?, ?)",
+                     (cat, hsn))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Error initializing HSN codes: {e}")
 
 def get_setting(key, default=''):
     try:
@@ -276,6 +425,158 @@ def get_setting(key, default=''):
         return row[0] if row else default
     except Exception:
         return default
+
+
+def _is_local_db_blank(db_path=None):
+    db_path = DB_PATH if db_path is None else db_path
+    try:
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        for table in ('products', 'customers', 'invoices'):
+            c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,))
+            if c.fetchone() is None:
+                continue
+            c.execute(f'SELECT COUNT(1) FROM {table}')
+            if c.fetchone()[0] > 0:
+                conn.close()
+                return False
+        conn.close()
+        return True
+    except Exception:
+        return False
+
+
+def _query_local_user(username, password_hash, db_path=None):
+    db_path = DB_PATH if db_path is None else db_path
+    try:
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        c.execute('SELECT username, role FROM users WHERE username=? AND password=?',
+                  (username, password_hash))
+        result = c.fetchone()
+        conn.close()
+        if result:
+            logger.info(f'Local user authentication SUCCESS for user={username}, role={result[1]}')
+        else:
+            logger.warning(f'Local user authentication FAILED for user={username}')
+        return result
+    except Exception as e:
+        logger.error(f'Error querying local user {username}: {e}')
+        return None
+
+
+def _authenticate_user_and_restore(username, password_hash, firebase_sync_manager=None, db_path=None):
+    """Enhanced authentication that works for ALL users (admin, manager, cashier)"""
+    db_path = DB_PATH if db_path is None else db_path
+    logger.info(f'[AUTH] Starting authentication for user={username}')
+    
+    # Step 1: Try local database first (fastest)
+    row = _query_local_user(username, password_hash, db_path=db_path)
+    if row:
+        logger.info(f'[AUTH] ✅ Local authentication SUCCESS for user={username}, role={row[1]}')
+        return row
+    
+    logger.info(f'[AUTH] User {username} not in local DB, checking Firebase...')
+    
+    # Step 2: Get Firebase manager if not provided
+    if firebase_sync_manager is None:
+        try:
+            from firebase_sync import get_firebase_sync_manager
+            credentials_path = _get_login_firebase_credentials_path()
+            firebase_sync_manager = get_firebase_sync_manager(credentials_path=credentials_path)
+        except Exception as e:
+            logger.warning(f'[AUTH] Firebase manager error: {e}')
+            firebase_sync_manager = None
+
+    # If Firebase is not available, log warning but DON'T return None yet
+    # (users might still exist locally or be created during app startup)
+    if not firebase_sync_manager or not getattr(firebase_sync_manager, 'db', None):
+        logger.warning(f'[AUTH] Firebase not available for user {username}, but continuing with offline-first mode')
+
+    try:
+        store_id = int(get_setting('store_id', '1'))
+    except Exception:
+        store_id = 1
+
+    # Step 3: Auto-restore ALL data if local DB is completely empty (only if Firebase available)
+    if firebase_sync_manager and getattr(firebase_sync_manager, 'db', None):
+        if _is_local_db_blank(db_path):
+            try:
+                logger.info(f'[AUTH] Local DB blank, auto-restoring from Firebase (store_id={store_id})...')
+                firebase_sync_manager.auto_restore_all_data(store_id)
+                logger.info(f'[AUTH] Auto-restore completed successfully')
+            except Exception as ex:
+                logger.warning(f'[AUTH] Auto-restore error: {ex}')
+            
+            # Try local auth again after restore
+            row = _query_local_user(username, password_hash, db_path=db_path)
+            if row:
+                logger.info(f'[AUTH] ✅ Authentication SUCCESS after restore: user={username}, role={row[1]}')
+                return row
+
+        # Step 4: Try individual user restore from Firebase (works for any user)
+        if not row:
+            try:
+                logger.info(f'[AUTH] Attempting to restore user {username} from Firebase...')
+                restored = firebase_sync_manager.restore_user_from_firebase(username, password_hash=password_hash)
+                if restored:
+                    logger.info(f'[AUTH] ✅ User restored from Firebase: {username}')
+                    row = _query_local_user(username, password_hash, db_path=db_path)
+                    if row:
+                        logger.info(f'[AUTH] ✅ Authentication SUCCESS after Firebase restore: user={username}, role={row[1]}')
+                        return row
+                else:
+                    logger.warning(f'[AUTH] Firebase restore returned False for user {username}')
+            except Exception as e:
+                logger.error(f'[AUTH] Firebase user restore failed for {username}: {e}')
+
+        # Step 5: Last resort - Check if user exists in Firebase backup data
+        if not row:
+            try:
+                from firebase_sync import _normalize_password_for_restore
+                logger.info(f'[AUTH] Checking Firebase users collection for {username}...')
+                users_doc = firebase_sync_manager.db.collection('stores').document(str(store_id)).collection('users').document('backup').get()
+                if users_doc.exists:
+                    users_data = users_doc.to_dict().get('users', [])
+                    for u in users_data:
+                        if u.get('username') == username:
+                            logger.info(f'[AUTH] Found user {username} in Firebase backup, verifying password...')
+                            # Normalize and verify password
+                            normalized_pwd = _normalize_password_for_restore(u.get('password'))
+                            if password_hash == normalized_pwd or password_hash == u.get('password'):
+                                role = u.get('role', 'cashier')  # Default to cashier if no role specified
+                                logger.info(f'[AUTH] Password verified, creating local entry for {username} with role={role}')
+                                # Create user in local DB
+                                conn = sqlite3.connect(db_path)
+                                cursor = conn.cursor()
+                                try:
+                                    cursor.execute(
+                                        'INSERT INTO users (username, password, role, full_name) VALUES (?, ?, ?, ?)',
+                                        (username, normalized_pwd, role, u.get('full_name', username))
+                                    )
+                                    conn.commit()
+                                    logger.info(f'[AUTH] ✅ Created user {username} in local DB with role {role}')
+                                    row = (username, role)
+                                except sqlite3.IntegrityError as ie:
+                                    logger.warning(f'[AUTH] User {username} already exists in local DB: {ie}')
+                                    # Try to query again
+                                    row = _query_local_user(username, password_hash, db_path=db_path)
+                                except Exception as e:
+                                    logger.warning(f'[AUTH] Could not create user {username}: {e}')
+                                finally:
+                                    conn.close()
+                                if row:
+                                    return row
+                            else:
+                                logger.warning(f'[AUTH] Password mismatch for {username} in Firebase')
+            except Exception as e:
+                logger.error(f'[AUTH] Firebase backup check error: {e}')
+    else:
+        logger.info(f'[AUTH] Firebase not available, skipping Firebase restore operations for {username}')
+
+    logger.error(f'[AUTH] ❌ Authentication FAILED for user={username} (not found in local DB or Firebase)')
+    return None
+
 
 def set_setting(key, value):
     try:
@@ -393,7 +694,7 @@ def _show_ai_prediction():
             if messagebox.askyesno('AI', 'Sales predictor not installed.\nOpen AI Assistant?'):
                 AIAssistantWindow(root)
             return
-        preds = predict_sales(7)
+        preds = predict_sales(7, db_path=DB_PATH)
         if preds:
             days = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun']
             msg = f'{HYPE_ERP_NAME} — AI Sales Forecast (Next 7 Days):\n\n'
@@ -448,13 +749,91 @@ def _trigger_backup():
 # LOGIN WINDOW
 # ───────────────────────────────────────────────────────────────────────────────
 def show_login():
-    global CURRENT_USER, CURRENT_ROLE
-    lw = Tk()
-    lw.title(f'{HYPE_ERP_NAME} — Login')
-    lw.geometry('440x520')
-    lw.configure(bg=C_BG)
-    lw.resizable(False, False)
-    set_icon(lw)
+    global CURRENT_USER, CURRENT_ROLE, LOGIN_WINDOW, LOGIN_IN_PROGRESS, APP_STARTED
+
+    # Use recursive lock to prevent any race conditions
+    with WINDOW_CREATION_LOCK:
+        logger.info('[LOGIN] show_login() called')
+        
+        # Check 0: Prevent child processes from showing login (PyInstaller safety)
+        if getattr(sys, 'frozen', False):
+            # In PyInstaller, only main process should show UI
+            try:
+                pid_file = os.path.join(tempfile.gettempdir(), 'hype_erp_main.pid')
+                import os as _os
+                current_pid = _os.getpid()
+                if os.path.exists(pid_file):
+                    with open(pid_file, 'r') as f:
+                        main_pid = int(f.read().strip())
+                    if current_pid != main_pid:
+                        logger.warning(f'[LOGIN] Child process {current_pid} detected, main is {main_pid} - exiting')
+                        sys.exit(0)
+                else:
+                    with open(pid_file, 'w') as f:
+                        f.write(str(current_pid))
+            except Exception as e:
+                logger.debug(f'PID check error: {e}')
+        
+        # Check 1: If login is already in progress, don't do anything
+        if LOGIN_IN_PROGRESS:
+            logger.warning('[LOGIN] ⚠️ Login in progress, ignoring duplicate request')
+            return
+
+        # Check 2: If main app is already running, bring to foreground
+        if APP_STARTED and root is not None:
+            try:
+                if root.winfo_exists():
+                    logger.info('[LOGIN] Main app already running, bringing to foreground')
+                    root.deiconify()
+                    root.focus_force()
+                    return
+            except Exception as e:
+                logger.error(f'[LOGIN] Error checking main app: {e}')
+
+        # Check 3: If login window already exists, bring to foreground
+        if LOGIN_WINDOW is not None:
+            try:
+                if LOGIN_WINDOW.winfo_exists():
+                    logger.info('[LOGIN] Login window exists, bringing to foreground')
+                    LOGIN_WINDOW.deiconify()
+                    LOGIN_WINDOW.focus_force()
+                    return
+                else:
+                    logger.info('[LOGIN] Previous login window was destroyed')
+                    LOGIN_WINDOW = None
+            except Exception as e:
+                logger.error(f'[LOGIN] Error checking login window: {e}')
+                LOGIN_WINDOW = None
+
+        # Check 4: Prevent window creation race condition - FINAL CHECK
+        if LOGIN_WINDOW is not None:
+            logger.warning('[LOGIN] LOGIN_WINDOW is not None after cleanup, aborting creation')
+            return
+
+        logger.info('[LOGIN] Creating new login window...')
+        
+        # Create window and assign INSIDE the lock to prevent race conditions
+        try:
+            lw = Tk()
+            lw.title(f'{HYPE_ERP_NAME} — Login')
+            lw.geometry('440x520')
+            lw.configure(bg=C_BG)
+            lw.resizable(False, False)
+            set_icon(lw)
+            LOGIN_WINDOW = lw
+            logger.info('[LOGIN] ✅ New login window created and assigned')
+        except Exception as e:
+            logger.error(f'[LOGIN] Failed to create window: {e}')
+            LOGIN_WINDOW = None
+            return
+
+    def _close_login_window():
+        global LOGIN_WINDOW
+        try:
+            if LOGIN_WINDOW is not None and LOGIN_WINDOW.winfo_exists():
+                LOGIN_WINDOW.destroy()
+        finally:
+            LOGIN_WINDOW = None
 
     # gradient-like header
     hdr = Frame(lw, bg=C_HEADER, pady=28)
@@ -476,7 +855,8 @@ def show_login():
                   insertbackground=C_TEXT, font=(FONT_UI, 12),
                   relief='flat', bd=0, highlightthickness=1,
                   highlightbackground=C_BORDER, highlightcolor=C_ACCENT)
-        if show: e.config(show=show)
+        if show:
+            e.config(show=show)
         e.pack(fill='x', ipady=8)
         return v
 
@@ -486,85 +866,133 @@ def show_login():
     err_lbl = Label(body, text='', bg=C_BG, fg='#f87171', font=(FONT_UI, 9))
     err_lbl.pack(pady=(8, 0))
 
-    def _is_local_db_blank():
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            c = conn.cursor()
-            for table in ('products', 'customers', 'invoices'):
-                c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,))
-                if c.fetchone() is None:
-                    continue
-                c.execute(f'SELECT COUNT(1) FROM {table}')
-                if c.fetchone()[0] > 0:
-                    conn.close()
-                    return False
-            conn.close()
-            return True
-        except Exception:
-            return False
-
     def do_login():
-        global CURRENT_USER, CURRENT_ROLE
+        global CURRENT_USER, CURRENT_ROLE, LOGIN_IN_PROGRESS, LOGIN_WINDOW
+
+        if LOGIN_IN_PROGRESS:
+            return
+
         uname = user_var.get().strip()
         password = pass_var.get()
+        
+        if not uname or not password:
+            err_lbl.config(text='⚠️ Enter username and password')
+            return
+        
         password_hash = _hash_password(password)
-
-        def query_local_user():
-            try:
-                conn = sqlite3.connect(DB_PATH)
-                c = conn.cursor()
-                c.execute('SELECT username,role FROM users WHERE username=? AND password=?',
-                          (uname, password_hash))
-                result = c.fetchone()
-                conn.close()
-                return result
-            except Exception:
-                return None
-
-        row = query_local_user()
+        LOGIN_IN_PROGRESS = True
 
         try:
             from firebase_sync import firebase_sync_manager
         except Exception:
             firebase_sync_manager = None
 
-        if not row and firebase_sync_manager and getattr(firebase_sync_manager, 'db', None):
+        sign_in_btn.config(state='disabled')
+        try:
+            row = _authenticate_user_and_restore(uname, password_hash, firebase_sync_manager=firebase_sync_manager)
+            if row:
+                CURRENT_USER, CURRENT_ROLE = row
+                logger.info(f'[LOGIN] ✅ Login successful for {CURRENT_USER} ({CURRENT_ROLE})')
+                try:
+                    if LOGIN_WINDOW is not None and LOGIN_WINDOW.winfo_exists():
+                        LOGIN_WINDOW.destroy()
+                finally:
+                    LOGIN_WINDOW = None
+                # Schedule main app launch to prevent blocking
+                lw.after(50, launch_main_app)
+            else:
+                logger.warning(f'[LOGIN] ❌ Login failed for {uname}')
+                err_lbl.config(text='\u274c Incorrect username or password')
+        except Exception as e:
+            logger.error(f'[LOGIN] Exception during login: {e}')
+            err_lbl.config(text=f'⚠️ Login error: {str(e)[:40]}')
+        finally:
+            LOGIN_IN_PROGRESS = False
             try:
-                store_id = int(get_setting('store_id', '1'))
+                sign_in_btn.config(state='normal')
             except Exception:
-                store_id = 1
+                pass
 
-            if _is_local_db_blank():
-                try:
-                    logger = __import__('logging').getLogger(__name__)
-                    logger.info('Local DB appears empty, auto-restoring from Firebase before login')
-                    firebase_sync_manager.auto_restore_all_data(store_id)
-                    row = query_local_user()
-                except Exception as ex:
-                    try: logger.warning(f'Auto-restore on login failed: {ex}')
-                    except Exception: pass
+    def start_login_flow():
+        global CURRENT_USER, CURRENT_ROLE, LOGIN_IN_PROGRESS
 
-            if not row:
+        if LOGIN_IN_PROGRESS:
+            return
+
+        uname = user_var.get().strip()
+        password = pass_var.get()
+        password_hash = _hash_password(password)
+        LOGIN_IN_PROGRESS = True
+
+        def show_status(text, color=C_BLUE):
+            try:
+                if LOGIN_WINDOW is not None and LOGIN_WINDOW.winfo_exists():
+                    LOGIN_WINDOW.after(0, lambda: err_lbl.config(text=text, fg=color))
+            except Exception:
+                pass
+
+        def finish_login(row, error_message=None):
+            global CURRENT_USER, CURRENT_ROLE, LOGIN_IN_PROGRESS, LOGIN_WINDOW
+            LOGIN_IN_PROGRESS = False
+            try:
+                if row:
+                    CURRENT_USER, CURRENT_ROLE = row
+                    if LOGIN_WINDOW is not None and LOGIN_WINDOW.winfo_exists():
+                        LOGIN_WINDOW.destroy()
+                    LOGIN_WINDOW = None
+                    launch_main_app()
+                    return
+
+                if error_message:
+                    err_lbl.config(text=f'⚠️ {error_message}', fg='#f87171')
+                else:
+                    err_lbl.config(text='❌ Incorrect username or password', fg='#f87171')
+            finally:
                 try:
-                    if firebase_sync_manager.restore_user_from_firebase(uname, password_hash=password_hash):
-                        row = query_local_user()
+                    sign_in_btn.config(state='normal')
                 except Exception:
                     pass
 
-        if row:
-            CURRENT_USER, CURRENT_ROLE = row
-            lw.destroy()
-            launch_main_app()
-        else:
-            err_lbl.config(text='\u274c Incorrect username or password')
+        sign_in_btn.config(state='disabled')
+        show_status('Checking credentials...', C_BLUE)
 
-    Button(body, text='Sign In', bg=C_ACCENT, fg='white',
-           font=(FONT_UI, 12, 'bold'), relief='flat',
-           padx=20, pady=10, cursor='hand2',
-           activebackground='#c73652', activeforeground='white',
-           command=do_login).pack(fill='x', pady=(18, 0))
+        def worker():
+            row = None
+            error_message = None
+            credentials_path = _get_login_firebase_credentials_path()
+            logger.info(f'Login attempt for user={uname}, db_path={DB_PATH}, credentials_path={credentials_path}')
+            try:
+                row = _query_local_user(uname, password_hash, db_path=DB_PATH)
+                if row:
+                    logger.info(f'Local login succeeded for user={uname}')
+                else:
+                    if _is_local_db_blank(DB_PATH):
+                        show_status('Restoring data from Firebase...', C_BLUE)
+                        logger.info(f'Local DB is blank, attempting Firebase restore for user={uname}')
+                    firebase_sync_manager = get_firebase_sync_manager(credentials_path=credentials_path)
+                    logger.info(f'Firebase manager ready: {type(firebase_sync_manager).__name__}, db={bool(getattr(firebase_sync_manager, "db", None))}, creds={getattr(firebase_sync_manager, "credentials_path", None)}')
+                    row = _authenticate_user_and_restore(uname, password_hash, firebase_sync_manager=firebase_sync_manager)
+            except Exception as exc:
+                error_message = str(exc) or 'Unable to complete sign in right now.'
+                logger.exception(f'Login worker failed for user={uname}: {error_message}')
 
-    lw.bind('<Return>', lambda e: do_login())
+            try:
+                if LOGIN_WINDOW is not None and LOGIN_WINDOW.winfo_exists():
+                    LOGIN_WINDOW.after(0, lambda: finish_login(row, error_message))
+            except Exception:
+                finish_login(row, error_message)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    sign_in_btn = Button(body, text='Sign In', bg=C_ACCENT, fg='white',
+                         font=(FONT_UI, 12, 'bold'), relief='flat',
+                         padx=20, pady=10, cursor='hand2',
+                         activebackground='#c73652', activeforeground='white',
+                         command=start_login_flow)
+    sign_in_btn.pack(fill='x', pady=(18, 0))
+
+    lw.protocol('WM_DELETE_WINDOW', _close_login_window)
+    lw.bind('<Return>', lambda e: start_login_flow())
     Label(body, text=HYPE_ERP_FOOTER, bg=C_BG, fg='#2d2d4e',
           font=(FONT_UI, 7)).pack(side='bottom', pady=8)
     lw.mainloop()
@@ -756,9 +1184,10 @@ def open_products_window():
 
         gst_var = StringVar(value='18.0')
         hsn_var = StringVar()
+        cat_code_var = StringVar()
         fields = [
             ('Product Name *', StringVar()), ('Barcode / SKU', StringVar()),
-            ('Category', StringVar(value='Grocery')), ('Unit', StringVar(value='pcs')),
+            ('Category', StringVar(value='Grocery')), ('Category Code', cat_code_var), ('Unit', StringVar(value='pcs')),
             ('Purchase Price', StringVar(value='0.00')), ('Selling Price *', StringVar(value='0.00')),
             ('Stock Qty', StringVar(value='0')), ('Min Stock Alert', StringVar(value='10')),
             ('GST Rate (%)', gst_var), ('HSN Code', hsn_var),
@@ -771,7 +1200,7 @@ def open_products_window():
         for lbl, var in fields:
             Label(frm, text=lbl, bg=C_BG, fg='#94a3b8',
                   font=(FONT_UI, 9)).pack(anchor='w', pady=(6, 2))
-            if lbl.startswith('Category'):
+            if lbl.startswith('Category') and not lbl.startswith('Category Code'):
                 cat_frame = Frame(frm, bg=C_BG)
                 cat_frame.pack(fill='x')
                 category_combo = ttk.Combobox(cat_frame, textvariable=var,
@@ -782,7 +1211,22 @@ def open_products_window():
                 def on_category_changed(event=None):
                     category_value = category_combo.get().strip()
                     if category_value:
+                        # Auto-populate GST rate
                         gst_var.set(f"{get_gst_rate_for_category(category_value):.2f}")
+                        
+                        # Auto-populate HSN code from category mapping
+                        try:
+                            conn = sqlite3.connect(DB_PATH)
+                            c = conn.cursor()
+                            c.execute("SELECT hsn_code FROM category_hsn_mapping WHERE category=?", (category_value,))
+                            result = c.fetchone()
+                            conn.close()
+                            if result and result[0]:
+                                hsn_var.set(result[0])
+                            else:
+                                hsn_var.set('')
+                        except Exception:
+                            hsn_var.set('')
 
                 category_combo.bind('<<ComboboxSelected>>', on_category_changed)
                 category_combo.bind('<FocusOut>', on_category_changed)
@@ -837,12 +1281,27 @@ def open_products_window():
 
         def save():
             try:
+                hsn_code = hsn_var.get().strip()
+                category = fields[2][1].get().strip()
+                
+                # If HSN code is not provided, try to get it from category mapping
+                if not hsn_code and category:
+                    conn = sqlite3.connect(DB_PATH)
+                    c = conn.cursor()
+                    c.execute("SELECT hsn_code FROM category_hsn_mapping WHERE category=?", (category,))
+                    result = c.fetchone()
+                    conn.close()
+                    if result:
+                        hsn_code = result[0]
+                
                 conn = sqlite3.connect(DB_PATH)
                 conn.execute("""
-                    INSERT INTO products (name,barcode,category,unit,purchase_price,
+                    INSERT INTO products (name,barcode,category,category_code,unit,purchase_price,
                     selling_price,stock,min_stock,gst_rate,hsn_code)
-                    VALUES (?,?,?,?,?,?,?,?,?,?)
-                """, tuple(v.get() for _, v in fields))
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                """, (fields[0][1].get(), fields[1][1].get(), category, cat_code_var.get(),
+                      fields[4][1].get(), fields[5][1].get(), fields[6][1].get(), fields[7][1].get(),
+                      fields[8][1].get(), gst_var.get(), hsn_code))
                 conn.commit(); conn.close()
                 refresh(); d.destroy()
                 messagebox.showinfo(HYPE_ERP_NAME, 'Product added!')
@@ -1043,6 +1502,14 @@ def manage_gst_config_window():
                command=cmd, relief='flat', padx=12, pady=7,
                font=(FONT_UI, 9, 'bold')).pack(side='left', padx=4)
     _win_footer(win)
+
+def manage_hsn_config_window():
+    """Open HSN Code Configuration Window"""
+    if HAS_HSN_CONFIG and HSNConfigModule:
+        hsn_module = HSNConfigModule(root, DB_PATH)
+        hsn_module.open()
+    else:
+        messagebox.showerror(HYPE_ERP_NAME, 'HSN Configuration module not found.\nPlease ensure modules/hsn_config.py exists.')
 
 def manage_settings_window():
     win = _win_base(f'{HYPE_ERP_NAME} — Settings', 580, 500)
@@ -1358,27 +1825,101 @@ def open_about():
 # MAIN DASHBOARD
 # ───────────────────────────────────────────────────────────────────────────────
 def launch_main_app():
-    global root, FIREBASE_SYNC
-    root = Tk()
-    root.title(f'{HYPE_ERP_NAME} {HYPE_ERP_VERSION}')
-    root.geometry('1366x768')
-    root.configure(bg=C_BG)
-    root.state('zoomed') if sys.platform == 'win32' else None
-    set_icon(root)
-    apply_dark_style()
+    global root, FIREBASE_SYNC, APP_STARTED
 
-    # Firebase init (only if configured)
-    if FIREBASE_AVAILABLE and _firebase_configured():
-        try:
-            key_path = load_firebase_key_temp() or get_runtime_path('serviceAccountKey.json')
-            if os.path.exists(key_path):
-                try:
-                    store_id = int(get_setting('store_id', '1'))
-                except Exception:
-                    store_id = 1
-                FIREBASE_SYNC = initialize_firebase_sync(credentials_path=key_path, store_id=store_id)
-        except Exception:
-            pass
+    with WINDOW_CREATION_LOCK:
+        if APP_STARTED and root is not None and root.winfo_exists():
+            try:
+                logger.info(f'Main app already started, user={CURRENT_USER}, role={CURRENT_ROLE}')
+                root.deiconify()
+                root.focus_force()
+            except Exception as e:
+                logger.error(f'Error bringing main app to foreground: {e}')
+            return
+
+        logger.info(f'Launching main app for user={CURRENT_USER}, role={CURRENT_ROLE}')
+        
+        # Validate manager role
+        if CURRENT_ROLE == 'manager':
+            logger.info(f'Manager login detected for user={CURRENT_USER}')
+        elif CURRENT_ROLE == 'admin':
+            logger.info(f'Admin login detected for user={CURRENT_USER}')
+        elif CURRENT_ROLE == 'cashier':
+            logger.info(f'Cashier login detected for user={CURRENT_USER}')
+        else:
+            logger.warning(f'Unknown role for user={CURRENT_USER}: {CURRENT_ROLE}')
+
+        APP_STARTED = True
+        root = Tk()
+        root.title(f'{HYPE_ERP_NAME} {HYPE_ERP_VERSION}')
+        root.geometry('1366x768')
+        root.configure(bg=C_BG)
+        root.state('zoomed') if sys.platform == 'win32' else None
+        set_icon(root)
+        apply_dark_style()
+
+        # Show loading status
+        loading_frame = Frame(root, bg=C_BG)
+        loading_frame.pack(fill='both', expand=True)
+        Label(loading_frame, text='Loading...', font=(FONT_UI, 20, 'bold'),
+              bg=C_BG, fg=C_ACCENT).pack(expand=True)
+        root.update()
+
+        # Firebase init (only if configured)
+        if FIREBASE_AVAILABLE and _firebase_configured():
+            try:
+                key_path = _get_login_firebase_credentials_path()
+                if key_path and os.path.exists(key_path):
+                    try:
+                        store_id = int(get_setting('store_id', '1'))
+                    except Exception:
+                        store_id = 1
+                    logger.info(f'Initializing Firebase sync with credentials path: {key_path}, store_id={store_id}')
+                    FIREBASE_SYNC = initialize_firebase_sync(credentials_path=key_path, store_id=store_id)
+                    logger.info(f'✅ Firebase sync initialized successfully')
+                    
+                    # ⚡ LOAD DATA FROM FIREBASE ⚡
+                    try:
+                        from firebase_upload_manager import get_upload_manager
+                        upload_mgr = get_upload_manager(FIREBASE_SYNC)
+                        
+                        if upload_mgr and FIREBASE_SYNC:
+                            # Load data synchronously to ensure it's available before UI renders
+                            logger.info(f"📥 Loading data from Firebase for store_id={store_id}...")
+                            try:
+                                # Call load_all_data directly
+                                result = upload_mgr.load_all_data(store_id, DB_PATH)
+                                if result:
+                                    logger.info("✅ Firebase data loaded successfully to local DB")
+                                else:
+                                    logger.warning("Load returned no data, but continuing...")
+                            except Exception as load_error:
+                                logger.warning(f"Could not load data synchronously: {load_error}, trying background sync...")
+                                # Fall back to background
+                                def _background_load():
+                                    try:
+                                        upload_mgr.load_all_data(store_id, DB_PATH)
+                                        logger.info("✅ Background data load finished")
+                                    except Exception as bg_error:
+                                        logger.error(f"Error in background data load: {bg_error}")
+                                
+                                load_thread = threading.Thread(target=_background_load, daemon=True)
+                                load_thread.start()
+                        else:
+                            logger.warning("Upload manager or Firebase sync not available")
+                    except Exception as e:
+                        logger.warning(f"Could not initialize Firebase upload manager: {e}")
+                    
+                else:
+                    logger.warning('Firebase credentials were not available during app startup')
+            except Exception as exc:
+                logger.error(f'Firebase initialization failed during startup: {exc}')
+        else:
+            logger.info('Firebase not configured or not available')
+
+    # Clear loading screen and build main UI
+    for widget in root.winfo_children():
+        widget.destroy()
 
     # ── TOP BAR ─────────────────────────────────────────────────────────────
     topbar = Frame(root, bg=C_HEADER, pady=0)
@@ -1591,6 +2132,7 @@ def launch_main_app():
         ('\U0001f4c9 Sales Report',        view_sales_report),
         ('\U0001f9d1 Customer List',       view_customer_history),
         ('\U0001f4cb GST Rates',           manage_gst_config_window),
+        ('\U0001f4b3 HSN Codes',          manage_hsn_config_window),
         ('\u2699\ufe0f  Settings',          manage_settings_window),
         ('\U0001f916 AI Assistant',        lambda: AIAssistantWindow(root) if HAS_AI else None),
     ]:
@@ -1647,6 +2189,8 @@ def launch_main_app():
     bm = _menu('Billing')
     bm.add_command(label='\U0001f9fe New Invoice', command=open_billing_window)
     bm.add_command(label='\U0001f4cb GST Configuration', command=manage_gst_config_window)
+    bm.add_command(label='\U0001f4b3 HSN Code Configuration', command=manage_hsn_config_window)
+    bm.add_separator()
     bm.add_command(label='\U0001f4c8 Sales Report', command=view_sales_report)
     bm.add_command(label='\U0001f9d1 Customer History', command=view_customer_history)
 
@@ -1716,10 +2260,14 @@ def launch_main_app():
         threading.Thread(target=lambda: run_auto_install(log_callback=_log), daemon=True).start()
 
     def on_close():
+        logger.info(f'Application closing for user={CURRENT_USER}')
         try:
             if FIREBASE_AVAILABLE and FIREBASE_SYNC:
+                logger.info('Shutting down Firebase sync')
                 shutdown_firebase_sync(FIREBASE_SYNC)
-        except Exception: pass
+        except Exception as e: 
+            logger.error(f'Error shutting down Firebase: {e}')
+        logger.info('=== Application Shutdown ===')
         root.destroy()
 
     root.protocol('WM_DELETE_WINDOW', on_close)
@@ -1727,25 +2275,63 @@ def launch_main_app():
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
-    print(f"""
-\u2554{'='*56}\u2557
-\u2551  {HYPE_ERP_NAME} {HYPE_ERP_VERSION:<48}\u2551
-\u2551  {HYPE_ERP_TAGLINE:<54}\u2551
-\u2551  Developer: David | github.com/david0154 {'':<14}\u2551
-\u2551  Default login : admin / admin123 {'':<20}\u2551
-\u255a{'='*56}\u255d
-    """)
+    # ✅ CRITICAL: Add multiprocessing support for PyInstaller
+    try:
+        multiprocessing.freeze_support()
+        logger.info('✅ multiprocessing.freeze_support() executed')
+    except Exception as e:
+        logger.warning(f'⚠️ freeze_support error: {e}')
+    
+    # ✅ Windows single-instance lock (prevent multiple app instances)
+    if HAS_WIN32:
+        try:
+            APP_INSTANCE_LOCK = win32event.CreateMutex(None, False, 'HYPE_ERP_SINGLE_INSTANCE')
+            last_error = win32api.GetLastError()
+            if last_error == winerror.ERROR_ALREADY_EXISTS:
+                logger.warning('Application already running - exiting')
+                print('⚠️  Hype ERP is already running!')
+                sys.exit(0)
+            logger.info('✅ Single-instance mutex created successfully')
+        except Exception as e:
+            logger.warning(f'⚠️ Could not create instance lock: {e}')
+    else:
+        logger.info('ℹ️  pywin32 not available - single-instance lock disabled (Linux/Mac)')
+    
+    banner = f"""
++{'='*56}+
+|  {HYPE_ERP_NAME} {HYPE_ERP_VERSION:<48}|
+|  {HYPE_ERP_TAGLINE:<54}|
+|  Developer: David | github.com/david0154 {'':<14}|
+|  Default login : admin / admin123 {'':<20}|
++{'='*56}+
+    """
+    try:
+        print(banner)
+    except UnicodeEncodeError:
+        print(banner.encode('ascii', errors='replace').decode('ascii'))
+    
+    logger.info('Initializing database')
     init_db()
+    logger.info('Database initialized successfully')
+    
     # Initialize background Firebase auto-sync if credentials are available.
     try:
         if _firebase_configured() and FIREBASE_AVAILABLE:
+            logger.info('Firebase is configured, initializing background sync')
             # Prefer temporary decrypted key if present
             creds_temp = load_firebase_key_temp() or 'serviceAccountKey.json'
             try:
                 store_id = int(get_setting('store_id', '1'))
             except Exception:
                 store_id = 1
+            logger.info(f'Starting Firebase background sync with store_id={store_id}')
             FIREBASE_SYNC = initialize_firebase_sync(credentials_path=creds_temp, store_id=store_id, interval_seconds=300)
-    except Exception:
+            logger.info('Firebase background sync started')
+        else:
+            logger.info('Firebase not configured, skipping background sync')
+    except Exception as e:
+        logger.error(f'Failed to initialize Firebase background sync: {e}')
         FIREBASE_SYNC = None
+    
+    logger.info('Showing login window')
     show_login()

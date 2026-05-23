@@ -13,3 +13,4 @@ cryptography>=38.0.0
 python-dateutil>=2.8.2
 barcode>=1.0.0
 fpdf2>=2.7.0
+pywin32>=305  # For Windows single-instance lock

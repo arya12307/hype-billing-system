@@ -15,7 +15,7 @@ Write-Host ""
 Write-Host "[1/4] Cleaning old build files..." -ForegroundColor Yellow
 if (Test-Path "dist") { Remove-Item -Recurse -Force "dist" }
 if (Test-Path "build") { Remove-Item -Recurse -Force "build" }
-if (Test-Path "HypeERP.spec") { Remove-Item -Force "HypeERP.spec" }
+# Note: Do NOT delete HypeERP.spec - we preserve it with all our fixes
 Write-Host "      Done." -ForegroundColor Green
 
 # Step 2: Encrypt Firebase key
@@ -32,93 +32,132 @@ if (Test-Path "serviceAccountKey.json") {
 Write-Host "[3/4] Running PyInstaller..." -ForegroundColor Yellow
 Write-Host ""
 
-pyinstaller `
-    --onefile `
-    --windowed `
-    --icon=icon.ico `
-    --name="HypeERP" `
-    --add-data "icon.ico;." `
-    --add-data "logo.png;." `
-    --add-data "modules;modules" `
-    --hidden-import "modules.account" `
-    --hidden-import "modules.account_invoice" `
-    --hidden-import "modules.account_asset" `
-    --hidden-import "modules.account_tax" `
-    --hidden-import "modules.account_statement" `
-    --hidden-import "modules.sale" `
-    --hidden-import "modules.purchase" `
-    --hidden-import "modules.stock" `
-    --hidden-import "modules.production" `
-    --hidden-import "modules.hr_module" `
-    --hidden-import "modules.payroll_module" `
-    --hidden-import "modules.crm_module" `
-    --hidden-import "modules.projects_module" `
-    --hidden-import "modules.timesheet" `
-    --hidden-import "modules.pos_module" `
-    --hidden-import "modules.stock_package" `
-    --hidden-import "modules.quality_control" `
-    --hidden-import "modules.marketing" `
-    --hidden-import "modules.reporting_module" `
-    --hidden-import "modules.erp_main_menu" `
-    --hidden-import "modules.mode_selector" `
-    --hidden-import "modules.scrollable_frame" `
-    --hidden-import "modules.erp_branding" `
-    --hidden-import "modules.inventory_analysis" `
-    --hidden-import "sklearn.utils._cython_blas" `
-    --hidden-import "sklearn.utils._typedefs" `
-    --hidden-import "sklearn.utils._heap" `
-    --hidden-import "sklearn.utils._sorting" `
-    --hidden-import "sklearn.utils._vector_sentinel" `
-    --hidden-import "sklearn.neighbors.typedefs" `
-    --hidden-import "sklearn.neighbors._partition_nodes" `
-    --hidden-import "sklearn.tree._utils" `
-    --hidden-import "sklearn.tree._criterion" `
-    --hidden-import "sklearn.tree._splitter" `
-    --hidden-import "sklearn.ensemble._forest" `
-    --hidden-import "sklearn.linear_model._base" `
-    --hidden-import "firebase_admin" `
-    --hidden-import "firebase_admin.credentials" `
-    --hidden-import "firebase_admin.firestore" `
-    --hidden-import "firebase_admin.auth" `
-    --hidden-import "firebase_admin.storage" `
-    --hidden-import "google.cloud.firestore" `
-    --hidden-import "google.cloud.firestore_v1" `
-    --hidden-import "google.auth" `
-    --hidden-import "google.auth.credentials" `
-    --hidden-import "google.oauth2" `
-    --hidden-import "google.oauth2.credentials" `
-    --hidden-import "google.oauth2.service_account" `
-    --hidden-import "reportlab.pdfgen" `
-    --hidden-import "reportlab.pdfgen.canvas" `
-    --hidden-import "reportlab.lib.pagesizes" `
-    --hidden-import "reportlab.lib.styles" `
-    --hidden-import "reportlab.lib.units" `
-    --hidden-import "reportlab.platypus" `
-    --hidden-import "PIL._tkinter_finder" `
-    --hidden-import "PIL.Image" `
-    --hidden-import "PIL.ImageTk" `
-    --hidden-import "cryptography.fernet" `
-    --hidden-import "cryptography.hazmat.primitives" `
-    --hidden-import "joblib" `
-    --hidden-import "numpy" `
-    --hidden-import "pandas" `
-    --hidden-import "pandas._libs.tslibs.np_datetime" `
-    --hidden-import "pandas._libs.tslibs.nattype" `
-    --hidden-import "pandas._libs.tslibs.timedeltas" `
-    --hidden-import "pandas._libs.skiplist" `
-    --hidden-import "sqlite3" `
-    --hidden-import "json" `
-    --hidden-import "tkinter" `
-    --hidden-import "tkinter.ttk" `
-    --hidden-import "tkinter.messagebox" `
-    --hidden-import "tkinter.filedialog" `
-    --hidden-import "tkinter.simpledialog" `
-    --collect-all "firebase_admin" `
-    --collect-all "google.cloud.firestore" `
-    --collect-all "google.auth" `
-    --collect-all "reportlab" `
-    --collect-all "sklearn" `
-    main.py
+$pyinstallerArgs = @(
+    "--onefile",
+    "--windowed",
+    "--icon=icon.ico",
+    "--name=HypeERP",
+    "--add-data", "icon.ico;.",
+    "--add-data", "logo.png;.",
+    "--add-data", "modules;modules"
+)
+
+if (Test-Path "firebase_runtime_config.json") {
+    $pyinstallerArgs += @("--add-data", "firebase_runtime_config.json;.")
+}
+
+if (Test-Path "serviceAccountKey.enc") {
+    $pyinstallerArgs += @("--add-data", "serviceAccountKey.enc;.")
+}
+
+$pyinstallerArgs += @(
+    "--hidden-import", "modules.account",
+    "--hidden-import", "modules.account_invoice",
+    "--hidden-import", "modules.account_asset",
+    "--hidden-import", "modules.account_tax",
+    "--hidden-import", "modules.account_statement",
+    "--hidden-import", "modules.sale",
+    "--hidden-import", "modules.purchase",
+    "--hidden-import", "modules.stock",
+    "--hidden-import", "modules.production",
+    "--hidden-import", "modules.hr_module",
+    "--hidden-import", "modules.payroll_module",
+    "--hidden-import", "modules.crm_module",
+    "--hidden-import", "modules.projects_module",
+    "--hidden-import", "modules.timesheet",
+    "--hidden-import", "modules.pos_module",
+    "--hidden-import", "modules.stock_package",
+    "--hidden-import", "modules.quality_control",
+    "--hidden-import", "modules.marketing",
+    "--hidden-import", "modules.reporting_module",
+    "--hidden-import", "modules.erp_main_menu",
+    "--hidden-import", "modules.mode_selector",
+    "--hidden-import", "modules.scrollable_frame",
+    "--hidden-import", "modules.erp_branding",
+    "--hidden-import", "modules.inventory_analysis",
+    "--hidden-import", "modules.vendor_module",
+    "--hidden-import", "modules.firebase_settings_ui",
+    "--hidden-import", "modules.window_utils",
+    "--hidden-import", "modules.data_service",
+    "--hidden-import", "modules.hsn_config",
+    "--hidden-import", "sklearn.utils._cython_blas",
+    "--hidden-import", "sklearn.utils._typedefs",
+    "--hidden-import", "sklearn.utils._heap",
+    "--hidden-import", "sklearn.utils._sorting",
+    "--hidden-import", "sklearn.utils._vector_sentinel",
+    "--hidden-import", "sklearn.neighbors.typedefs",
+    "--hidden-import", "sklearn.neighbors._partition_nodes",
+    "--hidden-import", "sklearn.tree._utils",
+    "--hidden-import", "sklearn.tree._criterion",
+    "--hidden-import", "sklearn.tree._splitter",
+    "--hidden-import", "sklearn.ensemble._forest",
+    "--hidden-import", "sklearn.linear_model._base",
+    "--hidden-import", "firebase_admin",
+    "--hidden-import", "firebase_admin.credentials",
+    "--hidden-import", "firebase_admin.firestore",
+    "--hidden-import", "firebase_admin.auth",
+    "--hidden-import", "firebase_admin.storage",
+    "--hidden-import", "google.cloud",
+    "--hidden-import", "google.cloud.firestore",
+    "--hidden-import", "google.cloud.firestore_v1",
+    "--hidden-import", "google.cloud.firestore_v1.base_client",
+    "--hidden-import", "google.auth",
+    "--hidden-import", "google.auth.credentials",
+    "--hidden-import", "google.auth.transport",
+    "--hidden-import", "google.auth.transport.requests",
+    "--hidden-import", "google.oauth2",
+    "--hidden-import", "google.oauth2.credentials",
+    "--hidden-import", "google.oauth2.service_account",
+    "--hidden-import", "grpc",
+    "--hidden-import", "reportlab",
+    "--hidden-import", "reportlab.pdfgen",
+    "--hidden-import", "reportlab.pdfgen.canvas",
+    "--hidden-import", "reportlab.lib",
+    "--hidden-import", "reportlab.lib.pagesizes",
+    "--hidden-import", "reportlab.lib.styles",
+    "--hidden-import", "reportlab.lib.units",
+    "--hidden-import", "reportlab.lib.colors",
+    "--hidden-import", "reportlab.platypus",
+    "--hidden-import", "reportlab.platypus.tables",
+    "--hidden-import", "PIL",
+    "--hidden-import", "PIL._tkinter_finder",
+    "--hidden-import", "PIL.Image",
+    "--hidden-import", "PIL.ImageTk",
+    "--hidden-import", "PIL.ImageDraw",
+    "--hidden-import", "cryptography",
+    "--hidden-import", "cryptography.fernet",
+    "--hidden-import", "cryptography.hazmat",
+    "--hidden-import", "cryptography.hazmat.primitives",
+    "--hidden-import", "cryptography.hazmat.primitives.ciphers",
+    "--hidden-import", "joblib",
+    "--hidden-import", "numpy",
+    "--hidden-import", "pandas",
+    "--hidden-import", "pandas._libs",
+    "--hidden-import", "pandas._libs.tslibs",
+    "--hidden-import", "pandas._libs.tslibs.np_datetime",
+    "--hidden-import", "pandas._libs.tslibs.nattype",
+    "--hidden-import", "pandas._libs.tslibs.timedeltas",
+    "--hidden-import", "pandas._libs.skiplist",
+    "--hidden-import", "sqlite3",
+    "--hidden-import", "json",
+    "--hidden-import", "tkinter",
+    "--hidden-import", "tkinter.ttk",
+    "--hidden-import", "tkinter.messagebox",
+    "--hidden-import", "tkinter.filedialog",
+    "--hidden-import", "tkinter.simpledialog",
+    "--hidden-import", "tkinter.scrolledtext",
+    "--collect-all", "firebase_admin",
+    "--collect-all", "google.cloud.firestore",
+    "--collect-all", "google.auth",
+    "--collect-all", "reportlab",
+    "--collect-all", "sklearn",
+    "--distpath", "dist",
+    "--workpath", "build",
+    "--specpath", ".",
+    "main.py"
+)
+
+python -m PyInstaller @pyinstallerArgs --clean --noconfirm 2>&1
 
 # Step 4: Result
 Write-Host ""
