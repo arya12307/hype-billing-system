@@ -1,7 +1,9 @@
 ; ===========================================================================
 ; Hype ERP v3.0.0 - Inno Setup Script
 ; Developer: David | Nexuzy Lab
-; Website: https://github.com/david0154/hype-billing-system
+; License:   NXL-E5AB-0B0-932 (NEXUZY Enterprise Software License)
+; Website:   https://nexuzy.tech
+; Developer: https://devilone.in
 ; Build with Inno Setup 6.x: https://jrsoftware.org/isinfo.php
 ; ===========================================================================
 
@@ -10,10 +12,10 @@ AppName=Hype ERP
 AppVersion=3.0.0
 AppVerName=Hype ERP v3.0.0
 AppPublisher=Nexuzy Lab
-AppPublisherURL=https://github.com/david0154
+AppPublisherURL=https://nexuzy.tech
 AppSupportURL=https://github.com/david0154/hype-billing-system/issues
 AppUpdatesURL=https://github.com/david0154/hype-billing-system/releases
-AppCopyright=Copyright (C) 2025-2026 Nexuzy Lab. Lead Developer: David
+AppCopyright=Copyright (C) 2025-2026 Nexuzy Lab. License: NXL-E5AB-0B0-932. Lead Developer: David (https://devilone.in)
 DefaultDirName={autopf}\HypeERP
 DefaultGroupName=Hype ERP
 AllowNoIcons=yes
@@ -80,8 +82,8 @@ Type: dirifempty; Name: "{localappdata}\HypeERP\exports"
 Type: dirifempty; Name: "{localappdata}\HypeERP\logs"
 
 [Messages]
-WelcomeLabel2=This will install [name/ver] on your computer.%n%nDeveloped by David | Nexuzy Lab%n%nHype ERP is a complete offline-first GST billing and ERP system with 19 enterprise modules, AI features, and Firebase cloud sync.%n%nIt is recommended that you close all other applications before continuing.
-FinishedLabel=Hype ERP v3.0.0 has been installed successfully!%n%nDefault Login: admin / admin123%nChange your password after first login.%n%nDeveloped by David | Nexuzy Lab
+WelcomeLabel2=This will install [name/ver] on your computer.%n%nDeveloped by David | Nexuzy Lab%nLicense: NXL-E5AB-0B0-932%n%nhttps://nexuzy.tech | https://devilone.in%n%nHype ERP is a complete offline-first GST billing and ERP system with 19 enterprise modules, AI features, and Firebase cloud sync.%n%nIt is recommended that you close all other applications before continuing.
+FinishedLabel=Hype ERP v3.0.0 has been installed successfully!%n%nDefault Login: admin / admin123%nChange your password after first login.%n%nDeveloped by David | Nexuzy Lab%nhttps://nexuzy.tech | https://devilone.in
 
 [Code]
 // Check if .NET / VC++ Redistributable is present (optional check)
