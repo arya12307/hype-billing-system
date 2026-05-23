@@ -34,7 +34,6 @@ class FirebaseUploadManager:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             
-            # Get all products
             cursor.execute('SELECT * FROM products')
             products = cursor.fetchall()
             
@@ -45,7 +44,6 @@ class FirebaseUploadManager:
             
             products_data = [dict(p) for p in products]
             
-            # Upload to Firebase with individual documents for better querying
             db = self.fsm.db
             batch = db.batch()
             
@@ -54,7 +52,6 @@ class FirebaseUploadManager:
                 ref = db.collection(f'stores/{store_id}/products').document(str(doc_id))
                 batch.set(ref, product, merge=True)
             
-            # Also upload backup collection
             backup_ref = db.collection(f'stores/{store_id}/products').document('backup')
             batch.set(backup_ref, {
                 'products': products_data,
@@ -83,7 +80,6 @@ class FirebaseUploadManager:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             
-            # Get all invoices with items
             cursor.execute('SELECT * FROM invoices')
             invoices = cursor.fetchall()
             
@@ -100,18 +96,15 @@ class FirebaseUploadManager:
                 inv_dict = dict(invoice)
                 inv_id = inv_dict.get('id', inv_dict.get('invoice_number', 'unknown'))
                 
-                # Get invoice items
                 cursor.execute('SELECT * FROM invoice_items WHERE invoice_id = ?', (inv_id,))
                 items = cursor.fetchall()
                 inv_dict['items'] = [dict(item) for item in items]
                 
                 invoices_data.append(inv_dict)
                 
-                # Upload individual invoice
                 ref = db.collection(f'stores/{store_id}/invoices').document(str(inv_id))
                 batch.set(ref, inv_dict, merge=True)
             
-            # Also upload backup collection
             backup_ref = db.collection(f'stores/{store_id}/invoices').document('backup')
             batch.set(backup_ref, {
                 'invoices': invoices_data,
@@ -152,13 +145,11 @@ class FirebaseUploadManager:
             db = self.fsm.db
             batch = db.batch()
             
-            # Upload individual customers
             for customer in customers_data:
                 cust_id = customer.get('id') or customer.get('name', 'unknown')
                 ref = db.collection(f'stores/{store_id}/customers').document(str(cust_id))
                 batch.set(ref, customer, merge=True)
             
-            # Backup collection
             backup_ref = db.collection(f'stores/{store_id}/customers').document('backup')
             batch.set(backup_ref, {
                 'customers': customers_data,
@@ -224,7 +215,6 @@ class FirebaseUploadManager:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             
-            # Check if stock table exists
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='stock'")
             if not cursor.fetchone():
                 conn.close()
@@ -272,16 +262,134 @@ class FirebaseUploadManager:
         logger.info(f"✅ UPLOAD COMPLETE: {success_count}/{len(results)} data types uploaded successfully")
         
         return results
-    
+
+    # -------------------------------------------------------------------------
+    # RESTORE / LOAD  (reads from the backup documents this class writes)
+    # -------------------------------------------------------------------------
+
+    def _restore_table(self, db_path: str, table: str, rows: list, pk_col: str = 'id') -> bool:
+        """Insert rows from Firebase into a local SQLite table, skipping duplicates."""
+        if not rows:
+            return True
+        try:
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            # Get current column names so we don't try to insert unknown columns
+            cursor.execute(f'PRAGMA table_info({table})')
+            cols = {row[1] for row in cursor.fetchall()}
+            if not cols:
+                conn.close()
+                logger.warning(f"Table '{table}' not found in local DB — skipping restore")
+                return False
+            for row in rows:
+                # Filter to only known columns
+                filtered = {k: v for k, v in row.items() if k in cols}
+                if not filtered:
+                    continue
+                placeholders = ', '.join(['?'] * len(filtered))
+                col_names = ', '.join(filtered.keys())
+                try:
+                    conn.execute(
+                        f'INSERT OR IGNORE INTO {table} ({col_names}) VALUES ({placeholders})',
+                        list(filtered.values())
+                    )
+                except Exception as row_err:
+                    logger.debug(f"Row insert skipped for {table}: {row_err}")
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            logger.error(f"Error restoring table '{table}': {e}")
+            return False
+
+    def restore_products_from_firebase(self, store_id: int, db_path: str) -> bool:
+        """Load products from Firebase backup into local DB."""
+        if not self.fsm or not getattr(self.fsm, 'db', None):
+            return False
+        try:
+            doc = self.fsm.db.collection(f'stores/{store_id}/products').document('backup').get()
+            if not doc.exists:
+                logger.info(f"No products backup found in Firebase for store {store_id}")
+                return True
+            products = doc.to_dict().get('products', [])
+            result = self._restore_table(db_path, 'products', products)
+            logger.info(f"✅ Restored {len(products)} products from Firebase (store {store_id})")
+            return result
+        except Exception as e:
+            logger.error(f"Error restoring products from Firebase: {e}")
+            return False
+
+    def restore_invoices_from_firebase(self, store_id: int, db_path: str) -> bool:
+        """Load invoices (and their items) from Firebase backup into local DB."""
+        if not self.fsm or not getattr(self.fsm, 'db', None):
+            return False
+        try:
+            doc = self.fsm.db.collection(f'stores/{store_id}/invoices').document('backup').get()
+            if not doc.exists:
+                logger.info(f"No invoices backup found in Firebase for store {store_id}")
+                return True
+            invoices = doc.to_dict().get('invoices', [])
+            items_all = []
+            invoices_clean = []
+            for inv in invoices:
+                items = inv.pop('items', []) or []
+                invoices_clean.append(inv)
+                items_all.extend(items)
+            r1 = self._restore_table(db_path, 'invoices', invoices_clean)
+            r2 = self._restore_table(db_path, 'invoice_items', items_all)
+            logger.info(f"✅ Restored {len(invoices_clean)} invoices, {len(items_all)} items from Firebase")
+            return r1 and r2
+        except Exception as e:
+            logger.error(f"Error restoring invoices from Firebase: {e}")
+            return False
+
+    def restore_customers_from_firebase(self, store_id: int, db_path: str) -> bool:
+        """Load customers from Firebase backup into local DB."""
+        if not self.fsm or not getattr(self.fsm, 'db', None):
+            return False
+        try:
+            doc = self.fsm.db.collection(f'stores/{store_id}/customers').document('backup').get()
+            if not doc.exists:
+                logger.info(f"No customers backup found in Firebase for store {store_id}")
+                return True
+            customers = doc.to_dict().get('customers', [])
+            result = self._restore_table(db_path, 'customers', customers)
+            logger.info(f"✅ Restored {len(customers)} customers from Firebase")
+            return result
+        except Exception as e:
+            logger.error(f"Error restoring customers from Firebase: {e}")
+            return False
+
+    def restore_users_from_firebase(self, db_path: str) -> bool:
+        """Load users from Firebase backup into local DB."""
+        if not self.fsm or not getattr(self.fsm, 'db', None):
+            return False
+        try:
+            doc = self.fsm.db.collection('system').document('users').get()
+            if not doc.exists:
+                logger.info("No users backup found in Firebase")
+                return True
+            users = doc.to_dict().get('users', [])
+            result = self._restore_table(db_path, 'users', users)
+            logger.info(f"✅ Restored {len(users)} users from Firebase")
+            return result
+        except Exception as e:
+            logger.error(f"Error restoring users from Firebase: {e}")
+            return False
+
     def load_all_data(self, store_id: int, db_path: str) -> dict:
-        """Load ALL data from Firebase and populate local database"""
+        """
+        Load ALL data from Firebase backup documents and populate local SQLite DB.
+        Uses self-contained restore methods — no dependency on FirebaseSync internals.
+        """
         logger.info(f"📥 STARTING COMPLETE DATA LOAD (store {store_id})...")
         
         results = {
-            'products': self.fsm.restore_products_to_db(store_id) if self.fsm else False,
-            'invoices': self.fsm.restore_bills_to_db(store_id) if self.fsm else False,
-            'customers': self.fsm.restore_customers_to_db(store_id) if self.fsm else False,
-            'users': self.fsm.restore_users_to_db() if self.fsm else False,
+            'products':  self.restore_products_from_firebase(store_id, db_path),
+            'invoices':  self.restore_invoices_from_firebase(store_id, db_path),
+            'customers': self.restore_customers_from_firebase(store_id, db_path),
+            'users':     self.restore_users_from_firebase(db_path),
         }
         
         success_count = sum(1 for v in results.values() if v)
@@ -294,10 +402,7 @@ class FirebaseUploadManager:
         try:
             logger.info("🔄 STARTING COMPLETE BIDIRECTIONAL SYNC...")
             
-            # First upload all local data
             upload_results = self.upload_all_data(store_id, db_path)
-            
-            # Then load/restore any missing data
             load_results = self.load_all_data(store_id, db_path)
             
             total_success = sum(1 for r in list(upload_results.values()) + list(load_results.values()) if r)
